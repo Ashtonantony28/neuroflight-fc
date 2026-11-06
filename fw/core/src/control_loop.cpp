@@ -62,8 +62,11 @@ void ControlLoop::set_target(const Vec3& pos, float yaw) {
 void ControlLoop::do_arm(uint64_t now, bool use_policy) {
   armed_ = true;
   // Arming point becomes the horizontal origin; z stays "height above ground".
-  Vec3 v = kf_.vel();
-  kf_.reset({0.0f, 0.0f, kf_.pos().z}, v);
+  // Horizontal velocity is unobservable on the ground (no flow below
+  // min_height_flow) and random-walks while disarmed, so it is zeroed: the
+  // vehicle is at rest when armed (WS6 SITL fix: after ~60 s disarmed it had
+  // drifted to ~5 m/s and tripped FAULT_ESTIMATOR right after takeoff).
+  kf_.reset({0.0f, 0.0f, kf_.pos().z}, {0.0f, 0.0f, kf_.vel().z});
   pid_.reset();
   cascade_.reset();
   policy_.reset();
