@@ -45,6 +45,21 @@ if(NF_BUILD_TESTS)
   target_link_libraries(bench_policy PRIVATE nf_core)
   target_compile_options(bench_policy PRIVATE ${NF_WARN})
   add_test(NAME bench_policy COMMAND bench_policy)
+  # Bit-exact check of a generated policy (tools/codegen.py) against the Python
+  # golden model's vectors (tools/gen_vectors.py). Driven by tools/pipeline.py:
+  #   -DNF_GEN_POLICY_DIR=<dir with nf_policy_gen.{hpp,cpp}> -DNF_GEN_POLICY_VECTORS=<vectors.bin>
+  set(NF_GEN_POLICY_DIR "" CACHE PATH "Directory with generated nf_policy_gen.hpp/.cpp")
+  set(NF_GEN_POLICY_VECTORS "" CACHE FILEPATH "Golden vector file for test_policy_bitexact")
+  if(NF_GEN_POLICY_DIR)
+    add_executable(test_policy_bitexact ${NF_ROOT}/test/tools/cpp/test_policy_bitexact.cpp
+                                        ${NF_GEN_POLICY_DIR}/nf_policy_gen.cpp)
+    target_include_directories(test_policy_bitexact PRIVATE ${NF_GEN_POLICY_DIR})
+    target_link_libraries(test_policy_bitexact PRIVATE nf_core)
+    target_compile_options(test_policy_bitexact PRIVATE ${NF_WARN})
+    if(NF_GEN_POLICY_VECTORS)
+      add_test(NAME policy_bitexact COMMAND test_policy_bitexact ${NF_GEN_POLICY_VECTORS})
+    endif()
+  endif()
   if(Python3_Interpreter_FOUND)
     add_test(NAME vehicle_params_up_to_date
              COMMAND ${Python3_EXECUTABLE} ${NF_ROOT}/tools/gen_params.py --check)

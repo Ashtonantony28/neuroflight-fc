@@ -83,8 +83,10 @@ The policy is trained against `sim/ctbr.py`; firmware must reproduce it exactly 
 - Observation attitude is currently ground truth in sim (no estimator error modelled yet); gyro has noise + bias.
 
 ## 11. int8 clarifications (from WS2, binding)
-- Rounding in §7 step 1 is **half away from zero**; numpy's `np.round` is half-to-even, so the golden model must implement it explicitly (`np.sign(x)*np.floor(np.abs(x)+0.5)` in float32).
+- Rounding in §7 step 1 is **half away from zero, matching C++ `std::round`** on the float32 value. numpy's `np.round` is half-to-even, and `floor(|x|+0.5)` in float32 is wrong for |x| = 0.49999997, so the golden model adds 0.5 in float64 (tools/golden.py is the reference).
 - NaN observation entries map to 0 before quantization.
 - Bias is added in int64 and the accumulator saturates to int32.
 - Codegen emits `s_x_last` (and all scales) as float32 literals; nothing is recomputed on target.
 - C++ structs `FloatModel` / `Int8Model` and the CRC32 rule are documented in `fw/core/include/nf/policy.hpp` — that header is the codegen target.
+- Every int8 layer must be followed by tanh (hidden `act: "none"` is rejected by the quantizer).
+- The `int8` block layout in `.nfpol.json` is defined by `tools/quantize.py` (`version`, `s_in`, `s_x_last`, `calib`, per layer `s_x`, `s_w`, `W_q`, `b_q`, and `s_pre`, `M`, `S`, `lut` on hidden layers).
