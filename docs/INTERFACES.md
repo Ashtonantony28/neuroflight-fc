@@ -67,3 +67,17 @@ Symmetric quantization, zero point 0 everywhere.
 - `fw/core/` – portable C++17 firmware core (no HAL, no heap after init, no exceptions/RTTI); host-buildable with CMake; unit tests under `fw/core/tests`.
 - `fw/sitl/` – host bridge that lets the sim call the firmware core (shared lib + ctypes).
 - `hw/` – board design spec, pin map, BOM.
+
+## 9. CTBR inner loop (must match between sim/ctbr.py and fw/core)
+The policy is trained against `sim/ctbr.py`; firmware must reproduce it exactly or transfer suffers.
+- Rate PID at `rate_loop_hz` (1 kHz). Gains are angular-acceleration gains multiplied by nominal inertia J (per axis):
+  `kp = (35, 35, 20)·J`, `ki = (60, 60, 20)·J`, `kd = (0.7, 0.7, 0)·J`.
+- P and I on error `e = ω_sp − ω`; D on **measurement** (−dω/dt), low-pass filtered with a first-order filter `alpha = 1 − exp(−2π·20 Hz·dt)`.
+- Integrator clamped to `|i| ≤ 8` per axis and **frozen while the mixer reports saturation**.
+- Mixer (thrusts → commands by inverting the thrust curve): roll/pitch differential thrusts are scaled down uniformly to fit `[T_idle, thrust_max]`; collective is then shifted to make room; yaw is added last with the largest scale s∈[0,1] that stays within limits.
+- Collective thrust and rate scaling use **nominal** `thrust_max` / `max_body_rate`.
+- Gains/filter live in `sim/ctbr.py::RatePIDGains`; the source of truth will move to `config/rate_pid.yaml` when the SITL workstream wires firmware ↔ sim.
+
+## 10. Reset conventions
+- "Previous action" (obs 15-18) is **zeros** at reset / on policy engage.
+- Observation attitude is currently ground truth in sim (no estimator error modelled yet); gyro has noise + bias.
