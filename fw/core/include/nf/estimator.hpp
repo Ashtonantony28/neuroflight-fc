@@ -28,6 +28,8 @@ class Mahony {
   // Level the attitude from one accel sample (roll/pitch, yaw = 0).
   void init_from_accel(const Vec3& accel);
   void update(const Vec3& gyro, const Vec3& accel, float dt);
+  // Seed the gyro bias (e.g. from GyroCalibrator); clamped to bias_limit.
+  void set_bias(const Vec3& b);
 
   const Quat& q() const { return q_; }
   const Vec3& bias() const { return bias_; }  // estimated gyro bias (rad/s)
@@ -45,6 +47,53 @@ class Mahony {
   Quat q_{};
   Vec3 bias_{};
   float innov_ = 0.0f, t_ = 0.0f;
+};
+
+// At-rest gyro calibration (FOLLOWUPS #3). Fed with raw IMU samples while the
+// vehicle is disarmed. Each window of `window_s` is accepted only if the
+// vehicle was still: per-axis gyro / accel standard deviations small, mean
+// gyro within the bias spec, |mean accel| ~ g, and no single sample showed
+// gross motion. Accepted windows set done() = true and bias() = average of
+// the window means since the last motion (up to max_avg_windows, after that
+// an exponential average that still tracks slow thermal drift).
+// Any motion (a rejected window or a gross sample) clears done() and restarts
+// the window, so arming is refused until the vehicle has been still for one
+// full window again. Fixed-size state, no heap.
+class GyroCalibrator {
+ public:
+  struct Config {
+    float window_s = 0.5f;
+    int max_avg_windows = 16;     // bias averaged over up to this many still windows
+    float max_gyro_std = 0.1f;    // rad/s per axis (noise spec <= 0.05)
+    float max_gyro_mean = 0.15f;  // rad/s per axis (bias spec <= 0.05)
+    float max_accel_std = 0.6f;   // m/s^2 per axis (noise spec <= 0.3)
+    float max_accel_err = 1.0f;   // m/s^2, | |mean accel| - g |
+    float motion_gyro = 0.5f;     // rad/s, any single sample above -> motion
+    float motion_accel = 3.0f;    // m/s^2, single sample | |a| - g | above -> motion
+    float gravity = 9.81f;
+  };
+  void init(const Config& c, float sample_hz);
+  void reset();  // forget the calibration (done() = false)
+  // One raw sample. Returns true when a still window just completed.
+  bool update(const Vec3& gyro, const Vec3& accel);
+  bool done() const { return done_; }
+  // Motion seen since the last accepted window (the calibration was dropped).
+  bool motion() const { return motion_; }
+  const Vec3& bias() const { return bias_; }
+  uint32_t windows() const { return windows_; }      // accepted windows
+  uint32_t rejections() const { return rejected_; }  // windows dropped for motion
+
+ private:
+  void restart() { n_ = 0; }
+  void reject();
+  Config c_{};
+  int window_n_ = 500, n_ = 0;
+  Vec3 ref_g_{}, ref_a_{};  // first sample of the window (sums are of deviations: float-safe)
+  Vec3 sg_{}, sg2_{}, sa_{}, sa2_{};
+  Vec3 bias_{};
+  bool done_ = false, motion_ = false;
+  uint32_t windows_ = 0, rejected_ = 0;
+  int avg_n_ = 0;  // still windows averaged into bias_ since the last motion
 };
 
 // Inputs for the translational estimator.

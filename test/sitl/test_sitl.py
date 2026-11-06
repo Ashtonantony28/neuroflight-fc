@@ -53,6 +53,32 @@ def test_fallback_hover_20_randomized():
     assert res.passed.all(), [(i, res.rms[i], res.modes[i], res.fault_history[i]) for i in np.nonzero(~res.passed)[0]]
 
 
+def test_arm_2s_after_power_on_and_hover_20_randomized():
+    """FOLLOWUPS #3/#4: at-rest gyro calibration + filtered A/B arming check.
+    Power on, still on the ground, arm at t = 2.0 s (first flick), hover.
+
+    Before the fix this was 0/20 (median 24 cm: uncalibrated gyro bias -> flow
+    velocity error h * bias), and vehicles needed up to 8 arm flicks.
+
+    Criterion: every vehicle arms on the first attempt, no faults or crash,
+    and the 10 s hover RMS error is < 5 cm. The 5 cm bound is close to the
+    noise floor of flow-only xy dead reckoning: a vehicle with max-spec noise
+    (vel 0.1 m/s at 100 Hz, gyro 0.05 rad/s) random-walks ~4 cm (1 sigma) over
+    the window even after a 120 s power-on (77/80 vehicles over seeds 1-4 at
+    120 s; 73/80 at 2 s, the gap being the ~1 mrad/s calibration noise left
+    after only 2 s of averaging). So the strict all-20 bound is checked
+    with a small allowance (>= 18/20 under 5 cm, none over 7.5 cm, median
+    under 3.5 cm) to keep the test meaningful without depending on one lucky
+    noise draw."""
+    res = S.fallback_hover(20, randomize=True, seed=1, power_on_s=1.5)
+    print("rms cm:", np.round(res.rms * 100, 2), "arm attempts:", res.arm_attempts)
+    assert (res.arm_attempts == 1).all(), res.arm_attempts
+    assert not res.crashed.any() and (res.fault_history == 0).all(), (res.modes, res.fault_history)
+    assert np.median(res.rms) < 0.035, np.median(res.rms)
+    assert (res.rms < S.HOVER_TOL_M).sum() >= 18, res.rms
+    assert res.rms.max() < 0.075, res.rms.max()
+
+
 # ---------------------------------------------------------------- (b) policy mode
 def test_policy_hover_synthetic_linear_policy():
     res = S.policy_hover(sitl.linear_hover_policy(), name="linear")
@@ -98,9 +124,26 @@ def test_fault_injection(fault_results, fault):
     r = fault_results[fault]
     assert r.passed, r.why
     # latency budgets: hold times of the corresponding monitors + 1 control period
-    budget_ms = {"nan": 2, "saturate": 202, "oscillate": 100, "flip": 300, "imu_b": 52, "rc_loss": 302,
+    budget_ms = {"nan": 2, "saturate": 202, "oscillate": 100, "flip": 120, "imu_b": 52, "rc_loss": 302,
                  "overrun": 8, "kill": 0}[fault]
     assert r.latency_ms <= budget_ms, r.latency_ms
+
+
+def test_flip_caught_early_by_predicted_tilt(fault_results):
+    """FOLLOWUPS #5: the 10 rad/s flip is handed to the fallback at < 40 deg
+    (was ~94 deg via the 60 deg + 50 ms TILT monitor) and never passes 60 deg."""
+    r = fault_results["flip"]
+    print(f"flip: switch-over tilt {r.switch_tilt_deg:.1f} deg, max tilt {r.max_tilt_deg:.0f} deg, alt lost {r.alt_lost_m:.3f} m")
+    assert r.first_fault == "TILT_PREDICTED"
+    assert r.switch_tilt_deg < 40.0
+    assert r.max_tilt_deg < 60.0
+    assert r.alt_lost_m < 0.25
+
+
+def test_nan_handover_is_bumpless(fault_results):
+    """FOLLOWUPS #6: the fallback starts from the estimated hover thrust, so the
+    NaN-policy handover no longer sags (was 0.35 m on the randomized vehicle)."""
+    assert fault_results["nan"].alt_lost_m < 0.05, fault_results["nan"].alt_lost_m
 
 
 def test_kill_in_fallback_mode_stops_motors_same_loop():

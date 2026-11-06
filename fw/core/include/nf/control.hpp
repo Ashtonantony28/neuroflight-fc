@@ -142,6 +142,12 @@ class CascadeController {
   //        used automatically when pos/height are invalid.
   CtbrCommand update(const VehicleState& s, const Vec3& pos_sp, float yaw_sp, CascadeMode mode, float dt);
   const Quat& q_sp() const { return q_sp_; }
+  // Bumpless handover (FOLLOWUPS #6): reset, then preload the vertical
+  // velocity integrator so that, level and at zero velocity error, the
+  // commanded collective equals hover_thrust_n (the estimated thrust that
+  // currently holds the vehicle up). Horizontal integrators start at 0.
+  void seed_hover_thrust(float hover_thrust_n);
+  const Vec3& vel_integrator() const { return vi_; }
 
  private:
   CascadeConfig c_{};

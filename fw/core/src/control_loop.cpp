@@ -7,12 +7,16 @@ uint32_t arming_checks(const ArmingInput& in, const ArmingConfig& c) {
   if (in.kill) f |= ARM_FAIL_KILL;
   if (!in.rc_link_ok) f |= ARM_FAIL_RC_LINK;
   if (!(in.throttle <= c.max_throttle)) f |= ARM_FAIL_THROTTLE;
-  if (in.imu.b_valid) {
-    if (!(norm(in.imu.gyro - in.imu.gyro_b) <= c.max_gyro_diff) ||
-        !(norm(in.imu.accel - in.imu.accel_b) <= c.max_accel_diff))
+  if (in.imu_b_valid) {
+    if (!in.imu_ab_ready || !(norm(in.gyro_ab_diff) <= c.max_gyro_diff) ||
+        !(norm(in.accel_ab_diff) <= c.max_accel_diff))
       f |= ARM_FAIL_IMU_DISAGREE;
   } else if (c.require_imu_b) {
     f |= ARM_FAIL_IMU_B_MISSING;
+  }
+  if (c.require_gyro_cal) {
+    if (in.gyro_motion) f |= ARM_FAIL_MOTION;
+    if (!in.gyro_cal_done) f |= ARM_FAIL_GYRO_CAL;
   }
   if (!in.est_converged) f |= ARM_FAIL_ESTIMATOR;
   if (!(in.tilt_rad <= c.max_tilt_rad)) f |= ARM_FAIL_TILT;
@@ -30,6 +34,15 @@ void ControlLoop::init(const ControlLoopConfig& c) {
   gyro_lpf_.init(c_.gyro_lpf_hz, fs);
   acc_lpf_.init(c_.accel_lpf_hz, fs);
   rpm_.init(fs);
+  cal_.init(c_.gyro_cal, fs);
+  for (int i = 0; i < 3; ++i) {
+    gdiff_[i].init(c_.arming.imu_diff_lpf_hz, fs);
+    adiff_[i].init(c_.arming.imu_diff_lpf_hz, fs);
+  }
+  imu_diff_n_ = 0;
+  imu_diff_min_n_ = static_cast<int>(c_.arming.imu_diff_min_s * fs + 0.5f);
+  hover_thrust_.init(c_.hover_est_lpf_hz, fs);
+  hover_thrust_.reset(c_.cascade.mass * c_.cascade.gravity);
   mahony_.init(c_.mahony);
   kf_.init(c_.kf);
   pid_.init(c_.rate, fs);
@@ -67,6 +80,7 @@ void ControlLoop::do_arm(uint64_t now, bool use_policy) {
   // vehicle is at rest when armed (WS6 SITL fix: after ~60 s disarmed it had
   // drifted to ~5 m/s and tripped FAULT_ESTIMATOR right after takeoff).
   kf_.reset({0.0f, 0.0f, kf_.pos().z}, {0.0f, 0.0f, kf_.vel().z});
+  hover_thrust_.reset(c_.cascade.mass * c_.cascade.gravity);
   pid_.reset();
   cascade_.reset();
   policy_.reset();
@@ -88,7 +102,10 @@ void ControlLoop::latch_hold_point() {
   if (!finite(p)) p = target_;
   hold_sp_ = p;
   hold_yaw_ = state_.q.yaw();
-  cascade_.reset();
+  // Bumpless transfer: start the fallback from the thrust that is holding the
+  // vehicle up now instead of from nominal weight (was a ~0.35 m sag).
+  if (c_.bumpless_handover) cascade_.seed_hover_thrust(hover_thrust_.value());
+  else cascade_.reset();
 }
 
 MotorOutput ControlLoop::step(const ImuSample& imu, const SensorSample& sens, const RcInput& rc, uint64_t now) {
@@ -100,6 +117,22 @@ MotorOutput ControlLoop::step(const ImuSample& imu, const SensorSample& sens, co
   ++step_count_;
 
   // ---- 1. sensing
+  // At-rest gyro calibration while disarmed (raw samples; DC is unchanged by
+  // the filters below). Each accepted window re-seeds the Mahony bias.
+  if (!armed_ && cal_.update(imu.gyro, imu.accel)) mahony_.set_bias(cal_.bias());
+  // IMU A/B agreement on low-passed differences (arming check).
+  {
+    const Vec3 gd = (imu.gyro - cal_.bias()) - imu.gyro_b;
+    const Vec3 ad = imu.accel - imu.accel_b;
+    if (imu.b_valid && finite(gd) && finite(ad)) {
+      if (imu_diff_n_ == 0)
+        for (int i = 0; i < 3; ++i) { gdiff_[i].reset(gd[i]); adiff_[i].reset(ad[i]); }
+      for (int i = 0; i < 3; ++i) { gdiff_[i].apply(gd[i]); adiff_[i].apply(ad[i]); }
+      if (imu_diff_n_ < imu_diff_min_n_) ++imu_diff_n_;
+    } else {
+      imu_diff_n_ = 0;
+    }
+  }
   if (c_.rpm_filter && sens.rpm_valid) rpm_.update(sens.motor_hz);
   Vec3 gyro = gyro_lpf_.apply(imu.gyro);
   if (c_.rpm_filter) gyro = rpm_.apply(gyro);
@@ -125,7 +158,11 @@ MotorOutput ControlLoop::step(const ImuSample& imu, const SensorSample& sens, co
   }
   if (!armed_ && arm_edge && !rc.kill) {
     ArmingInput ai;
-    ai.imu = imu;
+    ai.imu_b_valid = imu.b_valid;
+    ai.imu_ab_ready = imu_diff_n_ >= imu_diff_min_n_;
+    for (int i = 0; i < 3; ++i) { ai.gyro_ab_diff[i] = gdiff_[i].value(); ai.accel_ab_diff[i] = adiff_[i].value(); }
+    ai.gyro_cal_done = cal_.done();
+    ai.gyro_motion = cal_.motion();
     ai.est_converged = mahony_.converged(c_.arming.est_max_innov, c_.arming.est_min_time_s) && est_finite;
     ai.tilt_rad = tilt_angle(state_.q);
     ai.vbat = sens.vbat;
@@ -201,6 +238,14 @@ MotorOutput ControlLoop::step(const ImuSample& imu, const SensorSample& sens, co
     mix_ = mixer_.mix(ctbr_.thrust_n, tau);
     pid_.integrate(mix_.any_saturated());
     for (int i = 0; i < 4; ++i) out.cmd[i] = mix_.cmd[i];
+    // Hover-thrust estimate: thrust that gives 1 g of body-z specific force.
+    const float t_alloc = mix_.thrust[0] + mix_.thrust[1] + mix_.thrust[2] + mix_.thrust[3];
+    const float w = c_.cascade.mass * c_.cascade.gravity;
+    const float g = c_.cascade.gravity;
+    if (state_.height_valid && state_.pos.z > c_.hover_est_min_height_m && est_finite &&
+        tilt_angle(state_.q) < c_.hover_est_max_tilt && t_alloc > c_.min_thrust_for_i * w &&
+        acc.z > 0.5f * g && acc.z < 1.5f * g)
+      hover_thrust_.apply(clampf(g * t_alloc / acc.z, 0.5f * w, 2.0f * w));
   } else {
     mix_ = MixerResult{};
     pid_.reset();

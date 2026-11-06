@@ -47,8 +47,17 @@ const char* fault_name(uint32_t b) {
     case FAULT_POLICY_MISSING: return "POLICY_MISSING";
     case FAULT_KILL: return "KILL";
     case FAULT_DESCENT_ENVELOPE: return "DESCENT_ENVELOPE";
+    case FAULT_TILT_PREDICTED: return "TILT_PREDICTED";
     default: return "MULTIPLE/UNKNOWN";
   }
+}
+
+float tilt_rate(const Quat& q, const Vec3& w) {
+  const Mat3 R = q.to_mat();
+  const float r20 = R(2, 0), r21 = R(2, 1);
+  const float s = std::sqrt(r20 * r20 + r21 * r21);  // sin(tilt)
+  if (s < 1e-3f) return std::sqrt(w.x * w.x + w.y * w.y);
+  return -(r20 * w.y - r21 * w.x) / s;
 }
 
 void Supervisor::init(const SupervisorConfig& c) {
@@ -68,7 +77,8 @@ void Supervisor::arm(uint64_t now, bool use_policy) {
   last_rc_us_ = now;
   have_last_ = false;
   floor_armed_ = false;
-  tilt_ = rate_ = fence_ = floor_ = nonfinite_ = range_ = sat_ = imu_ = est_ = envelope_ = landed_ = Debounce{};
+  tilt_rate_ = pred_tilt_ = 0.0f;
+  tilt_ = pred_ = rate_ = fence_ = floor_ = nonfinite_ = range_ = sat_ = imu_ = est_ = envelope_ = landed_ = Debounce{};
   deadline_misses_ = 0;
   for (int i = 0; i < 4; ++i) { osc_bits_[i] = 0; osc_prev_[i] = 0; osc_prev_delta_[i] = 0; }
   osc_have_prev_ = false;
@@ -99,7 +109,13 @@ uint32_t Supervisor::evaluate(const SupervisorInput& in) {
   const bool in_policy = mode_ == FlightMode::POLICY;
 
   // --- envelope
-  if (tilt_.update(!in.q.finite() || tilt_angle(in.q) > c_.max_tilt_rad, now, c_.tilt_hold_us)) f |= FAULT_TILT;
+  const float tilt = tilt_angle(in.q);
+  if (tilt_.update(!in.q.finite() || tilt > c_.max_tilt_rad, now, c_.tilt_hold_us)) f |= FAULT_TILT;
+  // Predicted tilt (policy only: in fallback the fallback IS the recovery).
+  tilt_rate_ = in.q.finite() && finite(in.omega) ? tilt_rate(in.q, in.omega) : 0.0f;
+  pred_tilt_ = tilt + (tilt_rate_ > 0.0f ? tilt_rate_ * c_.pred_horizon_s : 0.0f);
+  const bool diverging = tilt_rate_ >= c_.pred_min_tilt_rate && pred_tilt_ > c_.pred_max_tilt_rad;
+  if (pred_.update(in_policy && diverging, now, c_.pred_hold_us)) f |= FAULT_TILT_PREDICTED;
   float rmax = std::fmax(std::fabs(in.omega.x), std::fmax(std::fabs(in.omega.y), std::fabs(in.omega.z)));
   if (rate_.update(!finite(in.omega) || rmax > c_.max_rate, now, c_.rate_hold_us)) f |= FAULT_RATE;
 
@@ -233,7 +249,7 @@ bool Supervisor::request_reengage(uint64_t now) {
   if (mode_ != FlightMode::FALLBACK_HOLD || active_ != 0) return false;
   mode_ = FlightMode::POLICY;
   mode_since_ = now;
-  nonfinite_ = range_ = sat_ = floor_ = envelope_ = Debounce{};
+  nonfinite_ = range_ = sat_ = floor_ = envelope_ = pred_ = Debounce{};
   deadline_misses_ = 0;
   for (int i = 0; i < 4; ++i) { osc_bits_[i] = 0; osc_prev_delta_[i] = 0; }
   osc_have_prev_ = false;

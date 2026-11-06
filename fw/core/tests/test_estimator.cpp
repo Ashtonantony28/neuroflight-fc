@@ -130,4 +130,102 @@ TEST(kf_rejects_outlier_and_reports_nis) {
   CHECK(nis_ok < 2.0f);
 }
 
+// ------------------------------------------------------------ GyroCalibrator
+namespace {
+struct Lcg {
+  uint32_t s = 7;
+  float randn() {  // approx N(0,1)
+    float a = 0;
+    for (int i = 0; i < 4; ++i) { s = s * 1664525u + 1013904223u; a += static_cast<float>(s >> 8) / 16777216.0f - 0.5f; }
+    return a * 1.732f;
+  }
+  Vec3 randn3(float sd) { return Vec3{randn(), randn(), randn()} * sd; }
+};
+}  // namespace
+
+TEST(gyro_cal_estimates_bias_from_one_still_window) {
+  GyroCalibrator cal;
+  cal.init({}, 1000.0f);
+  Lcg r;
+  const Vec3 bias{0.05f, -0.04f, 0.03f};          // edge of the randomization spec
+  const Vec3 up = Quat::from_euler(0.1f, -0.05f, 0).rotate_inv({0, 0, 9.81f});
+  int done_at = -1;
+  for (int i = 0; i < 2000; ++i) {
+    bool ok = cal.update(bias + r.randn3(0.05f), up + r.randn3(0.3f));  // max noise spec
+    if (ok && done_at < 0) done_at = i;
+  }
+  CHECK_EQ(done_at, 499);  // first 0.5 s window
+  CHECK(cal.done());
+  CHECK(!cal.motion());
+  CHECK_EQ(cal.windows(), 4);
+  for (int i = 0; i < 3; ++i) CHECK_NEAR(cal.bias()[i], bias[i], 0.003);  // 4 windows: 0.05/sqrt(2000) * 3 sigma
+  CHECK_EQ(cal.rejections(), 0);
+}
+
+TEST(gyro_cal_rejects_motion_and_restarts) {
+  GyroCalibrator cal;
+  cal.init({}, 1000.0f);
+  Lcg r;
+  const Vec3 up{0, 0, 9.81f};
+  // Gross rotation (picked up): never done, motion flagged.
+  for (int i = 0; i < 1000; ++i) cal.update({0.8f, 0, 0}, up);
+  CHECK(!cal.done());
+  CHECK(cal.motion());
+  // Slow wobble under the gross thresholds: window statistics reject it.
+  for (int i = 0; i < 1000; ++i) {
+    float t = static_cast<float>(i) * 0.001f;
+    cal.update({0.3f * std::sin(20.0f * t), 0, 0}, up + Vec3{1.0f * std::sin(15.0f * t), 0, 0});
+  }
+  CHECK(!cal.done());
+  CHECK(cal.motion());
+  CHECK(cal.rejections() >= 2u);
+  // Constant rotation beyond the bias spec (turntable): rejected too.
+  for (int i = 0; i < 600; ++i) cal.update({0, 0, 0.3f}, up);
+  CHECK(!cal.done());
+  // Free fall (accel ~ 0): gross motion.
+  for (int i = 0; i < 100; ++i) cal.update({}, {0, 0, 0.2f});
+  CHECK(cal.motion());
+  // Still for less than a window: not yet.
+  for (int i = 0; i < 400; ++i) cal.update(Vec3{0.01f, 0, 0} + r.randn3(0.02f), up + r.randn3(0.2f));
+  CHECK(!cal.done());
+  for (int i = 0; i < 100; ++i) cal.update(Vec3{0.01f, 0, 0} + r.randn3(0.02f), up + r.randn3(0.2f));
+  CHECK(cal.done());
+  CHECK(!cal.motion());
+  CHECK_NEAR(cal.bias().x, 0.01f, 0.004);
+  // A bump after calibration drops it again.
+  cal.update({0, 2.0f, 0}, up);
+  CHECK(!cal.done());
+  CHECK(cal.motion());
+  // NaN sample counts as motion.
+  for (int i = 0; i < 500; ++i) cal.update({}, up);
+  CHECK(cal.done());
+  cal.update({NAN, 0, 0}, up);
+  CHECK(!cal.done());
+}
+
+TEST(mahony_set_bias_seeds_and_clamps) {
+  Mahony m;
+  Mahony::Config c;
+  m.init(c);
+  m.set_bias({0.03f, -0.02f, 0.01f});
+  CHECK_NEAR(m.bias().x, 0.03f, 1e-7);
+  CHECK_NEAR(m.rates({0.03f, -0.02f, 0.01f}).y, 0.0f, 1e-7);
+  m.set_bias({1.0f, -1.0f, 0});
+  CHECK_NEAR(m.bias().x, c.bias_limit, 1e-7);
+  CHECK_NEAR(m.bias().y, -c.bias_limit, 1e-7);
+  m.set_bias({NAN, 0, 0});  // ignored
+  CHECK_NEAR(m.bias().x, c.bias_limit, 1e-7);
+  // Seeded with the true bias, the attitude holds with no drift even with ki = 0.
+  Mahony::Config c0;
+  c0.ki = 0.0f;
+  c0.kp = 0.0f;
+  c0.init_time_s = 0.0f;
+  Mahony m0;
+  m0.init(c0);
+  const Vec3 bias{0.04f, -0.03f, 0.02f};
+  m0.set_bias(bias);
+  for (int i = 0; i < 10000; ++i) m0.update(bias, {0, 0, 9.81f}, 0.001f);
+  CHECK(tilt_angle(m0.q()) < 1e-4f);
+}
+
 NFTEST_MAIN()

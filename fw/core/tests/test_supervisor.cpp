@@ -90,7 +90,11 @@ struct MonitorCase {
 TEST(every_monitor_trips_on_its_fault) {
   MonitorCase cases[] = {
       {"tilt", FAULT_TILT, [](Harness& h) { h.in.q = Quat::from_euler(1.3f, 0, 0); }, 40},
-      {"rate", FAULT_RATE, [](Harness& h) { h.in.omega.x = 15.0f; }, 20},
+      // Yaw spin: only the RATE monitor sees it (a 15 rad/s roll/pitch rate
+      // trips TILT_PREDICTED first, by design).
+      {"rate", FAULT_RATE, [](Harness& h) { h.in.omega.z = 15.0f; }, 20},
+      {"tilt_predicted", FAULT_TILT_PREDICTED,
+       [](Harness& h) { h.in.q = Quat::from_euler(0.5f, 0, 0); h.in.omega = {6.0f, 0, 0}; }, 15},
       {"geofence_xy", FAULT_GEOFENCE, [](Harness& h) { h.in.pos.x = 3.5f; }, 10},
       {"geofence_ceiling", FAULT_GEOFENCE, [](Harness& h) { h.in.pos.z = 2.8f; }, 10},
       {"height_floor", FAULT_HEIGHT_FLOOR, [](Harness& h) { h.in.pos.z = 0.15f; }, 80},
@@ -129,6 +133,89 @@ TEST(every_monitor_trips_on_its_fault) {
     CHECK(first_ok);
     CHECK(left_policy);
   }
+}
+
+TEST(tilt_rate_matches_numeric_derivative) {
+  uint32_t seed = 3;
+  auto u = [&seed](float a) {
+    seed = seed * 1664525u + 1013904223u;
+    return (static_cast<float>(seed >> 8) / 16777216.0f - 0.5f) * 2.0f * a;
+  };
+  int checked = 0;
+  for (int k = 0; k < 200; ++k) {
+    Quat q = Quat::from_euler(u(1.4f), u(1.4f), u(3.0f));
+    Vec3 w{u(8.0f), u(8.0f), u(8.0f)};
+    float t0 = tilt_angle(q);
+    if (t0 < 0.05f || t0 > 3.0f) continue;
+    const float h = 1e-3f;
+    float num = (tilt_angle(q.integrated(w, h)) - tilt_angle(q.integrated(w, -h))) / (2.0f * h);
+    CHECK_NEAR(tilt_rate(q, w), num, 0.02f + 0.01f * std::fabs(num));
+    ++checked;
+  }
+  CHECK(checked > 100);
+  // Level: any horizontal rate tilts away; yaw does not.
+  CHECK_NEAR(tilt_rate(Quat{}, {3.0f, 4.0f, 9.0f}), 5.0f, 1e-6);
+  CHECK_NEAR(tilt_rate(Quat{}, {0, 0, 9.0f}), 0.0f, 1e-6);
+  // Rolling back toward level is negative.
+  CHECK(tilt_rate(Quat::from_euler(0.5f, 0, 0), {-2.0f, 0, 0}) < -1.9f);
+}
+
+TEST(predicted_tilt_has_margin_on_clean_manoeuvring) {
+  // The clean-manoeuvring data (Harness::nominal) must stay well inside the
+  // predicted-tilt monitor's trip region, not just below it.
+  Harness h;
+  float max_pred = 0.0f, max_rate = 0.0f;
+  uint64_t end = h.t + 20000000ull;
+  while (h.t < end) {
+    h.nominal();
+    h.step();
+    max_pred = std::fmax(max_pred, h.sup.predicted_tilt());
+    max_rate = std::fmax(max_rate, h.sup.tilt_rate_est());
+  }
+  const SupervisorConfig c;
+  std::printf("  clean manoeuvring: max predicted tilt %.3f rad (trip %.2f), max tilt rate %.2f rad/s (gate %.1f)\n",
+              static_cast<double>(max_pred), static_cast<double>(c.pred_max_tilt_rad), static_cast<double>(max_rate),
+              static_cast<double>(c.pred_min_tilt_rate));
+  CHECK(max_pred < 0.8f * c.pred_max_tilt_rad);
+  CHECK(max_rate < 0.75f * c.pred_min_tilt_rate);
+  CHECK_EQ(h.sup.fault_history(), 0);
+}
+
+TEST(predicted_tilt_catches_flip_early) {
+  // Policy rolls the vehicle at 10 rad/s from level (the SITL "flip" fault):
+  // TILT_PREDICTED trips long before the 60 deg + 50 ms TILT monitor would.
+  Harness h;
+  h.run(500, none);
+  float roll = 0.0f, trip_tilt = -1.0f;
+  for (int i = 0; i < 400 && h.sup.mode() == FlightMode::POLICY; ++i) {
+    h.nominal();
+    float rate = std::fmin(10.0f, 0.2f * static_cast<float>(i));  // ramps up in 50 ms
+    roll += rate * 0.001f;
+    h.in.q = Quat::from_euler(roll, 0, 0);
+    h.in.omega = {rate, 0, 0};
+    h.in.gyro_a = h.in.gyro_b = h.in.omega;
+    h.step();
+    if (h.sup.mode() != FlightMode::POLICY) trip_tilt = roll;
+  }
+  std::printf("  flip: TILT_PREDICTED at tilt %.2f rad (%.0f deg)\n", static_cast<double>(trip_tilt),
+              static_cast<double>(trip_tilt * 57.2958f));
+  CHECK_EQ(h.sup.first_fault(), FAULT_TILT_PREDICTED);
+  CHECK(h.sup.mode() == FlightMode::FALLBACK_HOLD);
+  CHECK(trip_tilt > 0.0f && trip_tilt < 0.6f);
+}
+
+TEST(predicted_tilt_only_in_policy) {
+  // In FALLBACK_HOLD the fallback is the recovery: a fast roll there must not
+  // raise TILT_PREDICTED (the TILT/RATE envelope still escalates).
+  Harness h(SupervisorConfig{}, false);
+  h.run(300, [](Harness& x) { x.in.q = Quat::from_euler(0.5f, 0, 0); x.in.omega = {8.0f, 0, 0}; });
+  CHECK_EQ(h.sup.fault_history() & FAULT_TILT_PREDICTED, 0);
+  CHECK(h.sup.mode() == FlightMode::FALLBACK_HOLD);
+  // Tilting back toward level fast is not a divergence either.
+  Harness p;
+  p.run(300, [](Harness& x) { x.in.q = Quat::from_euler(0.9f, 0, 0); x.in.omega = {-8.0f, 0, 0}; });
+  CHECK_EQ(p.sup.fault_history() & FAULT_TILT_PREDICTED, 0);
+  CHECK_NEAR(static_cast<float>(std::strlen(fault_name(FAULT_TILT_PREDICTED))), 14.0f, 0);
 }
 
 TEST(short_glitches_are_debounced) {

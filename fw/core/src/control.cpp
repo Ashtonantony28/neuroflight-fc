@@ -162,6 +162,12 @@ void CascadeController::reset() {
   q_sp_ = {};
 }
 
+void CascadeController::seed_hover_thrust(float hover_thrust_n) {
+  reset();
+  if (!is_finite(hover_thrust_n) || !(c_.mass > 0.0f)) return;
+  vi_.z = clampf(hover_thrust_n / c_.mass - c_.gravity, -c_.vel_i_limit.z, c_.vel_i_limit.z);
+}
+
 CtbrCommand CascadeController::update(const VehicleState& s, const Vec3& pos_sp, float yaw_sp, CascadeMode mode,
                                       float dt) {
   const bool use_xy = s.pos_valid && mode != CascadeMode::LEVEL;

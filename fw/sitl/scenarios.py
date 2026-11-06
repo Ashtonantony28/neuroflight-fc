@@ -22,9 +22,9 @@ from sitl import (calibrated_nominal, CONTROLLED_DESCENT, FALLBACK_HOLD, FAULT, 
                   random_policy, standard_script, tilt_of_quat)
 
 TRAINED_POLICY = os.path.join(ROOT, "train", "policies", "hover_ctbr_v1.nfpol.json")
-# Mahony gyro-bias convergence time constant is kp/ki = 20 s (estimator.hpp
-# defaults); a shorter stationary power-on leaves gyro bias uncorrected, which
-# the flow velocity inherits as h * delta_bias (see report).
+# Long stationary power-on for the reference runs. Since the at-rest gyro
+# calibration (nf::GyroCalibrator) the firmware can also arm ~2 s after
+# power-on (see test_arm_2s_after_power_on_and_hover_20_randomized).
 POWER_ON_S = 120.0
 T_ARM = 0.5
 T_POLICY = 6.0
@@ -143,7 +143,7 @@ def make_faults(base: dict) -> list[Fault]:
         Fault("saturate", "a3 (yaw rate) pinned at +1 (bias +6)", "POLICY_SATURATION", FALLBACK_HOLD, poke(3, 6.0)),
         Fault("oscillate", "hot-swap to a policy with a 250 Hz limit cycle on a1 (amplitude ~0.9)",
               "POLICY_OSCILLATION", FALLBACK_HOLD, osc),
-        Fault("flip", "a1 (roll rate) pinned near +1: 10 rad/s roll", "TILT", FALLBACK_HOLD, poke(1, 3.0)),
+        Fault("flip", "a1 (roll rate) pinned near +1: 10 rad/s roll", "TILT_PREDICTED", FALLBACK_HOLD, poke(1, 3.0)),
         Fault("imu_b", "IMU B gyro x offset +1.0 rad/s", "IMU_DISAGREE", FALLBACK_HOLD, lambda r, e: None, gyro_b),
         Fault("rc_loss", "RC link lost (no valid frames)", "RC_LOSS", CONTROLLED_DESCENT, lambda r, e: None, rc_loss,
               lands=True),
@@ -167,6 +167,7 @@ class FaultResult:
     crash_reason: str
     kill_cmd_zero_loops: int   # kill: loops from kill input until all motor cmds == 0 (-1 = n/a)
     max_tilt_deg: float        # max true tilt in the 3 s after onset
+    switch_tilt_deg: float     # true tilt when the supervisor left POLICY (nan if it never did)
     end_tilt_deg: float
     end_z: float
     touchdown_vz: float
@@ -175,11 +176,12 @@ class FaultResult:
 
 
 def run_fault_suite(base: dict | None = None, randomize: bool = False, seed: int = 0,
-                    power_on_s: float = POWER_ON_S, only: list[str] | None = None):
-    """Run all faults (one env each) in one batched closed-loop flight."""
+                    power_on_s: float = POWER_ON_S, only: list[str] | None = None, repeat: int = 1):
+    """Run all faults (one env each; `repeat` vehicles per fault) in one
+    batched closed-loop flight."""
     synthetic = base is None
     base = base or linear_hover_policy()
-    faults = [f for f in make_faults(base) if only is None or f.name in only]
+    faults = [f for f in make_faults(base) if only is None or f.name in only] * repeat
     n = len(faults)
     r = SitlRunner(n, randomize=randomize, seed=seed, policy=base, log_decimate=1)
     assert r.policy_ok
@@ -220,6 +222,7 @@ def _analyze(f: Fault, e: int, r: SitlRunner, log) -> FaultResult:
     w = (t >= T_FAULT) & (t < T_FAULT + 3.0)
     alt_lost = max(0.0, float(z[k0] - z[w].min()))
     max_tilt = math.degrees(float(tilt_of_quat(log["quat"][w, e]).max()))
+    switch_tilt = math.degrees(float(tilt_of_quat(log["quat"][ks, e]))) if ks is not None else float("nan")
     first = int(log["first_fault"][-1, e])
     hist = int(log["fault_history"][-1, e])
     tilt_end = math.degrees(float(tilt_of_quat(log["quat"][-1, e])))
@@ -251,7 +254,7 @@ def _analyze(f: Fault, e: int, r: SitlRunner, log) -> FaultResult:
                 why.append(f"not recovered to a stable hover (z={z[-1]:.2f}, tilt={tilt_end:.0f} deg)")
     return FaultResult(f.name, e, "+".join(fault_names(first)) or "-", fault_names(hist), mode_after,
                        MODE_NAMES[mode[-1]], latency, alt_lost, bool(r.crashed[e]), r.crash_reason[e], kill_loops, max_tilt,
-                       tilt_end, float(z[-1]), td_vz, not why, "; ".join(why))
+                       switch_tilt, tilt_end, float(z[-1]), td_vz, not why, "; ".join(why))
 
 
 # =========================================================================== bad policy

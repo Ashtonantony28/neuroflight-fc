@@ -49,6 +49,76 @@ void Mahony::update(const Vec3& gyro, const Vec3& accel, float dt) {
   if (qn.finite()) q_ = qn;
 }
 
+void Mahony::set_bias(const Vec3& b) {
+  if (!finite(b)) return;
+  bias_ = clamp(b, {c_.bias_limit, c_.bias_limit, c_.bias_limit});
+}
+
+// ---------------------------------------------------------------- GyroCalibrator
+void GyroCalibrator::init(const Config& c, float sample_hz) {
+  c_ = c;
+  window_n_ = static_cast<int>(c_.window_s * sample_hz + 0.5f);
+  if (window_n_ < 2) window_n_ = 2;
+  reset();
+}
+
+void GyroCalibrator::reset() {
+  restart();
+  bias_ = {};
+  done_ = motion_ = false;
+  windows_ = rejected_ = 0;
+  avg_n_ = 0;
+}
+
+void GyroCalibrator::reject() {
+  done_ = false;
+  motion_ = true;
+  avg_n_ = 0;
+  ++rejected_;
+  restart();
+}
+
+bool GyroCalibrator::update(const Vec3& gyro, const Vec3& accel) {
+  const float g = c_.gravity;
+  if (!finite(gyro) || !finite(accel)) { reject(); return false; }
+  const float an = norm(accel);
+  if (std::fabs(gyro.x) > c_.motion_gyro || std::fabs(gyro.y) > c_.motion_gyro ||
+      std::fabs(gyro.z) > c_.motion_gyro || std::fabs(an - g) > c_.motion_accel) {
+    reject();
+    return false;
+  }
+  if (n_ == 0) {
+    ref_g_ = gyro;
+    ref_a_ = accel;
+    sg_ = sg2_ = sa_ = sa2_ = {};
+  }
+  const Vec3 dg = gyro - ref_g_, da = accel - ref_a_;
+  sg_ += dg;
+  sg2_ += hadamard(dg, dg);
+  sa_ += da;
+  sa2_ += hadamard(da, da);
+  if (++n_ < window_n_) return false;
+
+  const float inv = 1.0f / static_cast<float>(n_);
+  const Vec3 mg = sg_ * inv, ma = sa_ * inv;
+  bool still = true;
+  for (int i = 0; i < 3; ++i) {
+    const float vg = sg2_[i] * inv - mg[i] * mg[i];
+    const float va = sa2_[i] * inv - ma[i] * ma[i];
+    if (!(vg <= sq(c_.max_gyro_std)) || !(va <= sq(c_.max_accel_std))) still = false;
+    if (!(std::fabs(ref_g_[i] + mg[i]) <= c_.max_gyro_mean)) still = false;
+  }
+  if (!(std::fabs(norm(ref_a_ + ma) - g) <= c_.max_accel_err)) still = false;
+  if (!still) { reject(); return false; }
+  if (avg_n_ < c_.max_avg_windows) ++avg_n_;
+  bias_ += ((ref_g_ + mg) - bias_) * (1.0f / static_cast<float>(avg_n_));  // avg_n_ == 1: replace
+  done_ = true;
+  motion_ = false;
+  ++windows_;
+  restart();
+  return true;
+}
+
 void TranslationKf::init(const Config& c) {
   c_ = c;
   reset();

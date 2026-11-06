@@ -36,9 +36,16 @@ enum Fault : uint32_t {
   FAULT_POLICY_MISSING = 1u << 13,
   FAULT_KILL = 1u << 14,
   FAULT_DESCENT_ENVELOPE = 1u << 15,  // envelope still violated in fallback -> escalate
-  FAULT_COUNT_ = 16
+  FAULT_TILT_PREDICTED = 1u << 16,    // tilt + tilt_rate * horizon beyond the envelope (fast flip)
+  FAULT_COUNT_ = 17
 };
 const char* fault_name(uint32_t single_bit);
+
+// Rate of change of the tilt angle (rad/s, > 0 = tilting further away from
+// level) from attitude q (B->W) and body rates omega:
+//   tilt = acos(R22), dR22/dt = R20*wy - R21*wx, dtilt/dt = -dR22/dt / sin(tilt).
+// Near level (sin(tilt) ~ 0) any horizontal rate tilts away: |(wx, wy)|.
+float tilt_rate(const Quat& q, const Vec3& omega);
 
 // Persistence of a boolean condition over time.
 struct Debounce {
@@ -58,6 +65,16 @@ struct SupervisorConfig {
   uint32_t tilt_hold_us = 50000;
   float max_rate = 12.0f;              // rad/s, any axis (above CTBR limit 10)
   uint32_t rate_hold_us = 30000;
+  // Predicted tilt (FOLLOWUPS #5, POLICY only): trip when the vehicle is
+  // tilting away fast (tilt rate >= pred_min_tilt_rate) AND
+  // tilt + tilt_rate * pred_horizon_s > pred_max_tilt_rad, for pred_hold_us.
+  // The rate gate keeps it a fast-divergence detector (a large static tilt is
+  // the TILT monitor's job). Clean manoeuvring data (tilt <= 0.46 rad, rates
+  // <= 2.6 rad/s) peaks at a predicted tilt of ~0.7 rad and never meets the gate.
+  float pred_horizon_s = 0.1f;
+  float pred_max_tilt_rad = 1.05f;     // same envelope as max_tilt_rad
+  float pred_min_tilt_rate = 4.0f;     // rad/s
+  uint32_t pred_hold_us = 20000;     // > a 15 ms gyro glitch
   // Geofence (relative to arming origin) and height floor.
   float fence_radius_m = 3.0f;
   float fence_ceiling_m = 2.5f;
@@ -141,6 +158,9 @@ class Supervisor {
   uint32_t first_fault() const { return first_; }      // single bit, 0 if none
   uint64_t first_fault_time_us() const { return first_t_; }
   const SupervisorConfig& config() const { return c_; }
+  // Last evaluated tilt rate (rad/s) and predicted tilt (rad), for logging.
+  float tilt_rate_est() const { return tilt_rate_; }
+  float predicted_tilt() const { return pred_tilt_; }
 
  private:
   void raise(uint32_t bits, uint64_t now);
@@ -151,7 +171,8 @@ class Supervisor {
   uint32_t active_ = 0, history_ = 0, first_ = 0;
   uint64_t first_t_ = 0, mode_since_ = 0, last_now_ = 0, last_rc_us_ = 0;
   bool have_last_ = false, floor_armed_ = false;
-  Debounce tilt_, rate_, fence_, floor_, nonfinite_, range_, sat_, imu_, est_, envelope_, landed_;
+  float tilt_rate_ = 0.0f, pred_tilt_ = 0.0f;
+  Debounce tilt_, pred_, rate_, fence_, floor_, nonfinite_, range_, sat_, imu_, est_, envelope_, landed_;
   int deadline_misses_ = 0;
   // Oscillation: per-channel bit history of reversal events.
   uint64_t osc_bits_[4] = {0, 0, 0, 0};

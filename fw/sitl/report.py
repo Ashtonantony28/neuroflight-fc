@@ -51,8 +51,9 @@ def fault_rows(res, label):
             outcome = f"landed at {abs(r.touchdown_vz):.2f} m/s, {r.final_mode}"
         else:
             outcome = f"{r.final_mode}, z={r.end_z:.2f} m"
+        sw = "-" if math.isnan(r.switch_tilt_deg) else f"{r.switch_tilt_deg:.0f}"
         rows.append(f"| {label} | {r.fault} | {r.first_fault} | {r.mode_after} | {lat} | {r.alt_lost_m:.3f} | "
-                    f"{r.max_tilt_deg:.0f} | {outcome} | {'PASS' if r.passed else 'FAIL: ' + r.why} |")
+                    f"{sw} | {r.max_tilt_deg:.0f} | {outcome} | {'PASS' if r.passed else 'FAIL: ' + r.why} |")
     return rows
 
 
@@ -108,8 +109,14 @@ def main():
     w("|---|---|---|---|---|---|---|")
     for h in hov:
         w(hover_row(h))
-    w("\nThe last row is informational. It powers on for only 1.5 s, so the Mahony gyro bias has not converged "
-      "(time constant kp/ki = 20 s). The flow velocity then inherits h * delta_bias and the vehicle drifts horizontally. See the findings.\n")
+    sp = hov[2]
+    w(f"\nThe last row powers on for only 1.5 s and arms at t = 2.0 s. Before the at-rest gyro calibration it was 0/20 "
+      f"(median 24 cm, up to 8 arm flicks): the Mahony bias had not converged (kp/ki = 20 s) and the flow velocity inherited "
+      f"h * delta_bias. Now every vehicle arms on the first flick (max attempts {int(sp.arm_attempts.max())}) with the bias "
+      f"from about 2 s of still averaging, and {int(sp.passed.sum())}/{len(sp.rms)} hover under 5 cm. The 5 cm bound is close to the "
+      "noise floor of flow-only xy dead reckoning for max-spec sensor noise. Over seeds 1-4 (80 vehicles), 73/80 pass at 2 s and "
+      "77/80 after a 120 s power-on. The pytest version (`test_arm_2s_after_power_on_and_hover_20_randomized`) allows 2 of 20 "
+      "between 5 and 7.5 cm.\n")
 
     w("## (b) Policy mode\n")
     w("| scenario | RMS err (cm) | max err (cm) | worst z RMS (cm) | worst xy drift (cm) | faults | pass |")
@@ -128,11 +135,11 @@ def main():
 
     w("\n## (c)+(d) Fault injection (supervisor transitions)\n")
     w("Latency is measured from fault onset to the supervisor leaving POLICY, in 1 ms loop steps. Alt lost = true z at onset "
-      "minus the minimum true z over the next 3 s. Max tilt is over the same 3 s. "
+      "minus the minimum true z over the next 3 s. Switch tilt is the true tilt when the supervisor leaves POLICY. Max tilt is over the same 3 s. "
       "Pass requires the expected first fault, the expected mode, no crash (touchdown > 1 m/s or > 34 deg), and a "
       "stable hover at the end (or a landing and MOTOR_STOP for RC loss).\n")
-    w("| vehicle | fault | first fault | entered | latency (ms) | alt lost (m) | max tilt (deg) | outcome | result |")
-    w("|---|---|---|---|---|---|---|---|---|")
+    w("| vehicle | fault | first fault | entered | latency (ms) | alt lost (m) | switch tilt (deg) | max tilt (deg) | outcome | result |")
+    w("|---|---|---|---|---|---|---|---|---|---|")
     for row in fault_rows(f_nom, "nominal") + fault_rows(f_rnd, "randomized"):
         w(row)
     if f_tr:
@@ -163,18 +170,28 @@ def main():
       "the horizontal velocity cannot be observed (no flow below 8 cm), so it random-walks while disarmed. After 60 s it had reached ~5 m/s, "
       "and FAULT_ESTIMATOR tripped right after takeoff, which sent the vehicle into CONTROLLED_DESCENT. Arming now zeroes the "
       "horizontal velocity.")
-    w("2. **Arming IMU check uses single raw samples** (`arming_checks`: |gyro_a - gyro_b| <= 0.1 rad/s). Under the "
-      "randomized noise and bias it fails often, and some vehicles needed up to 9 arm flicks. It should compare filtered or "
-      "bias-corrected values.")
-    w("3. **Gyro bias converges slowly** (Mahony kp/ki = 20 s) and the firmware has no stationary calibration. Flow velocity "
-      "error = h * delta_bias, so x/y drifts by tens of cm in 10 s if the vehicle arms soon after power-on (row 3 of (a)).")
+    fn = next(r for r in f_nom if r.fault == "flip")
+    fr = next(r for r in f_rnd if r.fault == "flip")
+    nr_ = next(r for r in f_rnd if r.fault == "nan")
+    w("2. **Fixed (FOLLOWUPS #4): the arming IMU A/B check now uses filtered values.** It compares the 1 Hz low-passed difference "
+      "(gyro_a - calibrated bias_a) - gyro_b, and accel_a - accel_b, after at least 0.5 s of IMU B data, instead of single raw samples. "
+      "Before, some randomized vehicles needed up to 9 arm flicks. Now all 160 vehicles of the seed 1-4 randomized hover runs (2 s and 120 s power-on) arm on the first flick. "
+      "A real 0.3 rad/s IMU B offset is still refused (unit test).")
+    w("3. **Fixed (FOLLOWUPS #3): at-rest gyro calibration (`nf::GyroCalibrator`).** While disarmed, still windows of 0.5 s "
+      "(gyro/accel standard deviation, mean gyro and |g| gates, plus gross-motion gates on every sample) are averaged. The "
+      "result seeds the Mahony bias. Arming is refused (ARM_FAIL_GYRO_CAL / ARM_FAIL_MOTION) until a still window completes, "
+      "and again after any motion. See row 3 of (a).")
     w("4. **sim/env.py resets RateController without the gyro**, so the first step gets a D-term kick (table (e)). "
-      "The firmware seeds the previous measurement with the first sample.")
-    w("5. **Filter path in §9**: the firmware PID input is filtered and bias-corrected; the sim uses the raw gyro (table (e), last row).")
-    w("6. **Flip detection is slow**: the TILT trip takes 60 deg plus 50 ms, the commanded 10 rad/s stays under the 12 rad/s RATE limit, so "
-      "the fallback takes over at about 110 deg and the vehicle loses about 0.6 m. That is fine at 1 m and marginal lower down.")
-    w("7. Handover sag: the cascade's velocity integrator is reset when the fallback takes over, so a heavy vehicle can sag "
-      "for about 1 s (alt lost up to ~0.35 m on randomized NaN/saturate rows).")
+      "The firmware seeds the previous measurement with the first sample. (Open: FOLLOWUPS #1, sim/ is owned elsewhere.)")
+    w("5. **Filter path in §9**: the firmware PID input is filtered and bias-corrected; the sim uses the raw gyro (table (e), last row). (Open: FOLLOWUPS #2.)")
+    w(f"6. **Fixed (FOLLOWUPS #5): flips are caught early.** A new POLICY-only monitor, TILT_PREDICTED, trips when the tilt rate is at least 4 rad/s "
+      f"and tilt + tilt_rate * 0.1 s > 60 deg for 20 ms. Before, the TILT monitor (60 deg + 50 ms) handed over at about 94 deg, the tilt peaked "
+      f"at 110 deg and the vehicle lost 0.63 m. Now the switch-over tilt is {fn.switch_tilt_deg:.0f} deg nominal / {fr.switch_tilt_deg:.0f} deg randomized, "
+      f"the tilt peaks at {fn.max_tilt_deg:.0f} / {fr.max_tilt_deg:.0f} deg and the vehicle loses {fn.alt_lost_m:.2f} / {fr.alt_lost_m:.2f} m. "
+      "On the clean-manoeuvring unit-test data the predicted tilt peaks at 0.69 rad (trip at 1.05) and the tilt rate at 2.6 rad/s (gate 4).")
+    w(f"7. **Fixed (FOLLOWUPS #6): bumpless fallback handover.** The loop keeps a hover-thrust estimate, a 0.5 Hz low-pass of "
+      f"g * T_alloc / f_bz while flying near level. On handover from POLICY it preloads the cascade's vertical velocity integrator with it, "
+      f"instead of starting from nominal weight. Altitude lost in the randomized NaN case was 0.348 m before and is {nr_.alt_lost_m:.3f} m now.")
     open(OUT, "w").write("\n".join(L) + "\n")
     print(f"wrote {OUT} in {time.time() - t0:.0f} s")
 

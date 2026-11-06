@@ -63,14 +63,22 @@ enum ArmFail : uint32_t {
   ARM_FAIL_RC_LINK = 1u << 7,
   ARM_FAIL_KILL = 1u << 8,
   ARM_FAIL_TILT = 1u << 9,
+  ARM_FAIL_GYRO_CAL = 1u << 10,  // at-rest gyro calibration not finished
+  ARM_FAIL_MOTION = 1u << 11,    // motion detected while disarmed; calibration restarted
 };
 
 struct ArmingConfig {
   float min_vbat = 13.2f;        // 4S, 3.3 V/cell
   bool require_vbat = false;     // SITL has no battery model by default
   bool require_imu_b = false;
-  float max_gyro_diff = 0.1f;    // rad/s at rest
+  // IMU A/B agreement (FOLLOWUPS #4) is judged on the low-passed difference
+  // (gyro_a - calibrated bias_a) - gyro_b and accel_a - accel_b, not on single
+  // raw samples. The filter must have run imu_diff_min_s before it counts.
+  float max_gyro_diff = 0.1f;    // rad/s at rest (norm of filtered difference)
   float max_accel_diff = 1.0f;   // m/s^2
+  float imu_diff_lpf_hz = 1.0f;
+  float imu_diff_min_s = 0.5f;
+  bool require_gyro_cal = true;  // FOLLOWUPS #3
   float max_throttle = 0.05f;
   float max_tilt_rad = 0.5f;
   float est_max_innov = 0.05f;
@@ -78,7 +86,12 @@ struct ArmingConfig {
 };
 
 struct ArmingInput {
-  ImuSample imu{};
+  bool imu_b_valid = false;
+  Vec3 gyro_ab_diff{};       // filtered (see ArmingConfig)
+  Vec3 accel_ab_diff{};
+  bool imu_ab_ready = false; // filter warmed up
+  bool gyro_cal_done = false;
+  bool gyro_motion = false;
   bool est_converged = false;
   float tilt_rad = 0.0f;
   float vbat = 0.0f;
@@ -102,6 +115,13 @@ struct ControlLoopConfig {
   bool rpm_filter = true;
   float hold_height_m = 1.0f;                // default target z
   float min_thrust_for_i = 0.3f;             // * weight; below -> rate I reset (on ground)
+  // Hover-thrust estimate (bumpless fallback handover, FOLLOWUPS #6): low-pass
+  // of g * T_alloc / f_bz while flying near level above hover_est_min_height_m.
+  bool bumpless_handover = true;  // false: old behaviour (fallback integrators start at 0)
+  float hover_est_lpf_hz = 0.5f;
+  float hover_est_min_height_m = 0.15f;
+  float hover_est_max_tilt = 0.35f;
+  GyroCalibrator::Config gyro_cal{};
   Mahony::Config mahony{};
   TranslationKf::Config kf{};
   RatePidConfig rate{};
@@ -134,6 +154,10 @@ class ControlLoop {
   uint32_t last_inference_us() const { return inference_us_; }
   bool policy_ok() const;
   bool armed() const { return armed_; }
+  const GyroCalibrator& gyro_cal() const { return cal_; }
+  float hover_thrust_estimate() const { return hover_thrust_.value(); }
+  Vec3 imu_gyro_diff() const { return {gdiff_[0].value(), gdiff_[1].value(), gdiff_[2].value()}; }
+  const CascadeController& cascade() const { return cascade_; }
 
  private:
   void do_arm(uint64_t now, bool use_policy);
@@ -142,6 +166,10 @@ class ControlLoop {
   BiquadLpfVec3 gyro_lpf_{};
   Pt1Vec3 acc_lpf_{};
   RpmNotchBank rpm_{};
+  GyroCalibrator cal_{};
+  Pt1 gdiff_[3], adiff_[3];
+  int imu_diff_n_ = 0, imu_diff_min_n_ = 500;
+  Pt1 hover_thrust_{};
   Mahony mahony_{};
   TranslationKf kf_{};
   RatePid pid_{};

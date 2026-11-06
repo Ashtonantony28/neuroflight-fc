@@ -18,6 +18,7 @@ struct QuadSim {
   Vec3 ext_torque{};   // disturbance (N m)
   uint32_t rng = 12345;
   float gyro_noise = 0.0f, acc_noise = 0.0f;
+  float thrust_scale = 1.0f;  // actual / nominal thrust (weak or strong motors)
 
   float randn() {  // cheap approx normal
     float s = 0;
@@ -42,7 +43,7 @@ struct QuadSim {
         float c = clampf(cmd[i], 0.0f, 1.0f);
         float tau = c > w[i] ? vehicle::kMotorTauUp : vehicle::kMotorTauDown;
         w[i] += (c - w[i]) * (h / tau);
-        T[i] = thrust_of(w[i]);
+        T[i] = thrust_scale * thrust_of(w[i]);
       }
       const float a = vehicle::kArmXy, k = vehicle::kYawTorqueCoeff;
       Vec3 tau{a * (T[0] - T[1] - T[2] + T[3]), a * (-T[0] - T[1] + T[2] + T[3]), k * (T[0] - T[1] + T[2] - T[3])};
