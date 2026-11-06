@@ -81,3 +81,10 @@ The policy is trained against `sim/ctbr.py`; firmware must reproduce it exactly 
 ## 10. Reset conventions
 - "Previous action" (obs 15-18) is **zeros** at reset / on policy engage.
 - Observation attitude is currently ground truth in sim (no estimator error modelled yet); gyro has noise + bias.
+
+## 11. int8 clarifications (from WS2, binding)
+- Rounding in §7 step 1 is **half away from zero**; numpy's `np.round` is half-to-even, so the golden model must implement it explicitly (`np.sign(x)*np.floor(np.abs(x)+0.5)` in float32).
+- NaN observation entries map to 0 before quantization.
+- Bias is added in int64 and the accumulator saturates to int32.
+- Codegen emits `s_x_last` (and all scales) as float32 literals; nothing is recomputed on target.
+- C++ structs `FloatModel` / `Int8Model` and the CRC32 rule are documented in `fw/core/include/nf/policy.hpp` — that header is the codegen target.
