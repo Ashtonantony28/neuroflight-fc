@@ -1,0 +1,14 @@
+# Domain randomization: multiplicative ranges unless noted (uniform).
+mass: [0.85, 1.15]
+inertia: [0.80, 1.20]
+thrust_max: [0.85, 1.15]
+per_motor_thrust_imbalance: [0.95, 1.05]   # independent per motor
+yaw_torque_coeff: [0.8, 1.2]
+motor_tau: [0.7, 1.3]
+lin_drag: [0.5, 1.5]
+latency_s: [0.0, 0.008]                    # absolute
+gyro_noise_std: [0.0, 0.05]                # rad/s, absolute
+gyro_bias: [-0.05, 0.05]                   # rad/s, absolute, per axis
+accel_noise_std: [0.0, 0.3]                # m/s^2, absolute
+vel_noise_std: [0.0, 0.1]                  # m/s (flow-derived velocity)
+pos_noise_std: [0.0, 0.05]                 # m

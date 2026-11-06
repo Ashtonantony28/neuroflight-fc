@@ -1,0 +1,18 @@
+# Nominal 3" ducted quad (pre-system-ID estimates). All SI units.
+# Real values replace these after M3 system identification.
+mass: 0.250              # kg, all-up incl. 4S 650 mAh battery
+inertia: [2.5e-4, 2.5e-4, 4.0e-4]   # kg m^2, body x/y/z (diagonal)
+arm_xy: 0.046            # m, |x| = |y| of each motor from CoG (X config)
+thrust_max: 4.5          # N per motor at full command
+thrust_curve_a: 0.7      # T = thrust_max * (a*w^2 + (1-a)*w), w = motor state in [0,1]
+yaw_torque_coeff: 0.006  # m, |yaw torque| = coeff * thrust
+motor_tau_up: 0.030      # s, first-order motor lag when spinning up
+motor_tau_down: 0.045    # s, when spinning down
+idle_command: 0.05       # minimum motor command while armed
+lin_drag: [0.10, 0.10, 0.15]        # N/(m/s), body-frame linear drag
+rot_drag: [1.0e-5, 1.0e-5, 1.5e-5]  # N m/(rad/s)
+gravity: 9.81
+control_rate_hz: 500     # policy / outer loop
+rate_loop_hz: 1000       # inner rate PID + IMU
+latency_s: 0.003         # IMU sample -> motor effect
+max_body_rate: [10.0, 10.0, 6.0]    # rad/s, CTBR command limits
