@@ -1,0 +1,45 @@
+ref,qty,description,manufacturer,mpn,footprint,unit_usd,lcsc,lcsc_status,jlc_lib,populate,notes
+U1,1,MCU Cortex-M7 480 MHz 2 MB flash,ST,STM32H743VIT6,LQFP-100_14x14mm_P0.5mm,14.00,C114408,verify,extended,yes,price swings a lot; check stock before ordering
+U2,1,IMU A 6-axis,TDK InvenSense,ICM-42688-P,LGA-14_2.5x3mm_P0.5mm,4.00,,verify,extended,yes,on IMU island; 3V3_IMU
+U3,1,IMU B 6-axis,Bosch,BMI270,LGA-14_2.5x3mm_P0.5mm,4.00,,verify,extended,yes,on IMU island; 3V3_IMU
+U4,1,Barometer,Infineon,DPS310XTSA1,LGA-8_2x2.5mm,3.00,,verify,extended,yes,cover with open-cell foam
+U5,1,1 Gbit SPI/QSPI NAND (blackbox),Winbond,W25N01GVZEIG,WSON-8_8x6mm,3.00,,verify,extended,yes,NAND: indirect mode only (no memory-mapped)
+U6,1,Buck 4.2-60 V in / 5 V 1.5 A fixed,TI,LMR36015FSC5RNXR,VQFN-HR-12_2x3mm,2.50,,verify,extended,yes,60 V rating gives margin on 6S; confirm suffix for fixed-5V/1 MHz variant
+L1,1,Inductor 4.7 uH shielded >=2.5 A Isat,Sunlord,SWPA4030S4R7MT,4030,0.15,,verify,extended,yes,value per LMR36015 datasheet for 1 MHz / 5 V out
+U7,1,LDO 3.3 V 1.2 A digital (ceramic-stable),ST,LDL1117S33R,SOT-223,0.30,,verify,extended,yes,~0.6 W worst case; thermal vias under tab
+U8,1,LDO 3.3 V 250 mA low-noise (IMU island),TI,LP5907MFX-3.3/NOPB,SOT-23-5,0.40,,verify,extended,yes,6.5 uVrms
+U9,1,USB ESD protection,ST,USBLC6-2SC6,SOT-23-6,0.15,C7519,likely,basic,yes,
+U10,1,FPGA iCE40UP5K (S3 co-processor),Lattice,iCE40UP5K-SG48ITR,QFN-48_7x7mm_P0.5mm,6.00,,verify,extended,no,DNP on v1 (decision 5)
+U11,1,LDO 1.2 V 500 mA (FPGA core),TI,TLV75512PDBVR,SOT-23-5,0.25,,verify,extended,no,DNP with U10
+Q1,1,N-MOSFET buzzer driver,Alpha&Omega,AO3400A,SOT-23,0.05,C20917,likely,basic,yes,
+D1,1,Schottky VBUS->5V OR-ing 1 A,Diodes,B5819W,SOD-123,0.03,C8598,likely,basic,yes,
+D2,1,Flyback diode buzzer,onsemi,1N4148WS,SOD-323,0.02,C2128,likely,basic,yes,
+D3,1,TVS on VBAT input 26 V standoff,Littelfuse,SMBJ26A,SMB,0.15,,verify,extended,yes,clamps ESC spikes below LMR36015 60 V
+LED1-LED3,3,LED 0603 (green PWR / blue STATUS / red WARN),Everlight,19-217/GHC-YR1S2/3T (or equiv),0603,0.03,,verify,basic,yes,pick from JLC basic LEDs
+BZ-PADS,1,Buzzer solder pads (external 5 V active buzzer),-,-,2x pad 1.5x2mm,0.00,,n/a,none,yes,
+Y1,1,Crystal 8 MHz 3225 +-20 ppm,Yangxing,X322508MSB4SI,SMD-3225_4P,0.15,,verify,basic,yes,load caps per crystal CL
+C-XTAL,2,Cap 12 pF 50 V C0G 0402,Samsung,CL05C120JB5NNNC,0402,0.01,,verify,basic,yes,recompute for crystal CL and stray
+J1,1,USB-C receptacle 16-pin (USB2),Korean Hroparts,TYPE-C-31-M-12,USB-C_16P_SMD,0.25,C165948,likely,extended,yes,
+J2,1,ESC connector JST-SH 8-pin,JST,SM08B-SRSS-TB(LF)(SN),JST_SH_SM08B,0.25,,verify,extended,yes,check pinout vs. ESC harness
+J3,1,Receiver JST-SH 4-pin (5V GND TX RX),JST,SM04B-SRSS-TB(LF)(SN),JST_SH_SM04B,0.15,,verify,extended,yes,
+J4,1,Flow/ToF JST-SH 4-pin (5V GND TX RX),JST,SM04B-SRSS-TB(LF)(SN),JST_SH_SM04B,0.15,,verify,extended,yes,
+J5,1,Aux JST-SH 6-pin (5V GND TX6 RX6 SCL2 SDA2),JST,SM06B-SRSS-TB(LF)(SN),JST_SH_SM06B,0.20,,verify,extended,yes,
+J6,1,SWD Tag-Connect TC2030-NL footprint (no part),Tag-Connect,TC2030-IDC-NL footprint,TC2030-NL,0.00,,n/a,none,yes,cable bought once (see ORDER-LIST)
+J7,1,SWD 1.27 mm 2x5 header (alt. to J6),Samtec,FTSH-105-01-F-DV-K,1.27mm_2x5_SMD,1.20,,verify,extended,no,DNP; populate on first 1-2 boards if no Tag-Connect cable
+SW1,1,BOOT tactile switch SMD,XKB,TS-1088-AR02016,SMD_3x4mm,0.05,,verify,extended,yes,
+FB1-FB2,2,Ferrite bead 600R@100MHz 1 A,Murata,BLM18PG601SN1D,0603,0.03,,verify,basic,yes,FB1 before U8 (IMU LDO); FB2 into VDDA
+C-100N,32,Cap 100 nF 16 V X7R 0402,Samsung,CL05B104KO5NNNC,0402,0.003,C1525,likely,basic,yes,1 per VDD pin + every IC
+C-1U,12,Cap 1 uF 16 V X5R 0402,Samsung,CL05A105KA5NQNC,0402,0.005,C52923,likely,basic,yes,
+C-2U2,2,Cap 2.2 uF 10 V X5R 0402 (VCAP),Samsung,CL05A225MQ5NSNC,0402,0.01,,verify,basic,yes,ESR < 1 ohm; one per VCAP pin
+C-10U,8,Cap 10 uF 10 V X5R 0603,Samsung,CL10A106KP8NNNC,0603,0.01,C19702,likely,basic,yes,
+C-22U,3,Cap 22 uF 10 V X5R 0805 (buck out),Samsung,CL21A226MAQNNNE,0805,0.02,,verify,basic,yes,
+C-IN,3,Cap 2.2 uF 50 V X7R 1206 (buck in),Samsung,CL31B225KBHNNNE,1206,0.05,,verify,basic,yes,50 V for 6S; bulk low-ESR electrolytic lives on ESC
+R-10K,14,Res 10 k 1% 0402,UniOhm,0402WGF1002TCE,0402,0.001,C25744,likely,basic,yes,pull-ups / BOOT0 / dividers
+R-1K,6,Res 1 k 1% 0402,UniOhm,0402WGF1001TCE,0402,0.001,C11702,likely,basic,yes,VBAT divider low side / LED / CUR RC
+R-4K7,2,Res 4.7 k 1% 0402 (I2C1 pull-up),UniOhm,0402WGF4701TCE,0402,0.001,C25900,likely,basic,yes,
+R-2K2,2,Res 2.2 k 1% 0402 (I2C2 pull-up),UniOhm,0402WGF2201TCE,0402,0.001,,verify,basic,yes,
+R-5K1,2,Res 5.1 k 1% 0402 (USB-C CC),UniOhm,0402WGF5101TCE,0402,0.001,C25905,likely,basic,yes,
+R-20K,1,Res 20 k 1% 0402 (VBUS divider),UniOhm,0402WGF2002TCE,0402,0.001,,verify,basic,yes,
+R-33R,4,Res 33 R 1% 0402 (DShot series),UniOhm,0402WGF330JTCE,0402,0.001,,verify,basic,yes,place at MCU end; tune 22-100 R on scope
+R-100K,1,Res 100 k 1% 0402 (FPGA_IRQ pull-down),UniOhm,0402WGF1003TCE,0402,0.001,,verify,basic,yes,
+TP,14,Test point pad 1.0 mm (no part),-,-,TP_1.0mm,0.00,,n/a,none,yes,one per rail + key signals
