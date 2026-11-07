@@ -134,6 +134,18 @@ struct ControlLoopConfig {
   uint32_t (*clock_us)() = nullptr;
 };
 
+// Diagnostic input override (SITL / HIL sim-to-real gap analysis only; leave
+// unset in flight). Bits in `mask` replace what the POLICY observes (attitude,
+// rates, position, velocity) and/or the rate measurement fed to the rate PID,
+// after the estimator has run. The supervisor, fallback and logs keep using
+// the real estimate. Used by fw/sitl/diagnose_gap.py.
+struct InputOverride {
+  enum : uint32_t { POLICY_Q = 1u, POLICY_OMEGA = 2u, POLICY_POS = 4u, POLICY_VEL = 8u, PID_OMEGA = 16u };
+  uint32_t mask = 0;
+  Quat q{};
+  Vec3 omega_policy{}, omega_pid{}, pos{}, vel{};
+};
+
 class ControlLoop {
  public:
   // No heap: all state lives in this object. Call once.
@@ -142,6 +154,8 @@ class ControlLoop {
   void set_policy(const Int8Model* m);
   // Target for the policy and for FALLBACK_HOLD (until a fault latches the hold point).
   void set_target(const Vec3& pos, float yaw);
+  // Diagnostics only (see InputOverride). nullptr disables (default).
+  void set_input_override(const InputOverride* o) { ovr_ = o; }
   MotorOutput step(const ImuSample& imu, const SensorSample& sensors, const RcInput& rc, uint64_t now_us);
 
   // Introspection (logging / tests).
@@ -191,6 +205,7 @@ class ControlLoop {
   bool first_ = true, armed_ = false, prev_arm_sw_ = false, prev_reengage_ = false;
   bool policy_crc_ok_ = false;
   FlightMode prev_mode_ = FlightMode::DISARMED;
+  const InputOverride* ovr_ = nullptr;
 };
 
 }  // namespace nf

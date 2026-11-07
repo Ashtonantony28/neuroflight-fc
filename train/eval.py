@@ -153,7 +153,16 @@ def apply_extreme(p, idx, key, which, rand, nominal, dt, max_delay):
         raise KeyError(f"eval: no extreme handler for randomization key {key}")
 
 
-def build(n: int, n_ext: int, seed: int, extremes: bool = True, scenarios=SCENARIOS):
+SENSING = {
+    # the v1 training env: raw gyro into PID/obs, truth + white noise pos/vel
+    "v1": dict(gyro_filter=False, estimator=False),
+    # firmware sensing path (sim/fw_estimator.py): filtered bias-corrected gyro,
+    # flow/ToF KF position/velocity -- what the policy sees on the vehicle
+    "fw": dict(gyro_filter=True, estimator=True),
+}
+
+
+def build(n: int, n_ext: int, seed: int, extremes: bool = True, scenarios=SCENARIOS, sensing: str = "v1"):
     nominal, rand = load_nominal(), load_randomization()
     groups, rows = [], 0
     for sc in scenarios:
@@ -166,7 +175,7 @@ def build(n: int, n_ext: int, seed: int, extremes: bool = True, scenarios=SCENAR
                 groups.append(Group(f"{k}={which}/{sc}", sc, "extreme", slice(rows, rows + n_ext)))
                 rows += n_ext
     env = QuadEnv(EnvConfig(num_envs=rows, seed=seed, use_nominal=False, episode_len_s=1e6,
-                            randomize_initial_time=False), nominal=nominal, randomization=rand)
+                            randomize_initial_time=False, **SENSING[sensing]), nominal=nominal, randomization=rand)
     env.reset()
     q = env.quad
     g = torch.Generator().manual_seed(seed + 12345)
@@ -185,9 +194,8 @@ def build(n: int, n_ext: int, seed: int, extremes: bool = True, scenarios=SCENAR
         pos, vel, quat, omega = initial_states(gr.scenario, idx.numel(), g)
         w = q.hover_motor_state(idx)
         q.set_state(idx, pos=pos, vel=vel, quat=quat, omega=omega, motor=w, cmd=w)
-    env.rate_ctrl.reset(torch.arange(rows))
     env.prev_action.zero_()
-    env.last_gyro = q.sample_gyro()
+    env.reinit_sensing(torch.arange(rows))   # filters/KF/rate PID for the new states (no D kick)
     env._compute_obs()
     return env, groups, nominal
 
@@ -205,6 +213,14 @@ def rollout(env, ctrl, horizon_s=HORIZON_S):
     last_bad = torch.zeros(n)        # last time (s) the env was outside the settle band
     win = min(HF_WINDOW, steps)
     acts = torch.zeros(win, n, 4)
+    # firmware supervisor envelope monitors on the true state (fw/core supervisor.cpp):
+    # TILT_PREDICTED: tilt rate >= 4 rad/s and tilt + 0.1 s * rate > 1.05 rad for 20 ms;
+    # TILT: tilt > 1.05 rad for 50 ms. Counted from t = 0 (includes the initial state).
+    hold_pred = int(round(0.020 / env.control_dt))
+    hold_tilt = int(round(0.050 / env.control_dt))
+    c_pred = torch.zeros(n, dtype=torch.long)
+    c_tilt = torch.zeros(n, dtype=torch.long)
+    trip = torch.zeros(n, dtype=torch.bool)
     for k in range(steps):
         a = ctrl(obs).clamp(-1, 1)
         obs, _, done, info = env.step(a)
@@ -219,6 +235,11 @@ def rollout(env, ctrl, horizon_s=HORIZON_S):
             err_tail = torch.where(live, err_tail + err / tail, err_tail)
         if k >= steps - win:
             acts[k - (steps - win)] = a
+        tl, tr = env.tilt_and_rate()
+        pred_on = (tr >= 4.0) & (tl + 0.1 * tr.clamp_min(0) > 1.05)
+        c_pred = torch.where(pred_on, c_pred + 1, torch.zeros_like(c_pred))
+        c_tilt = torch.where(tl > 1.05, c_tilt + 1, torch.zeros_like(c_tilt))
+        trip |= live & ((c_pred >= hold_pred) | (c_tilt >= hold_tilt))
         newly = (info["crash"] | info["oob"]) & live
         failed |= newly
     final_tilt = torch.rad2deg(torch.acos(env.quad.R[:, 2, 2].clamp(-1, 1)))
@@ -235,7 +256,7 @@ def rollout(env, ctrl, horizon_s=HORIZON_S):
         P[..., -1] /= 2.0
     hf_ms = (P[..., hf_mask]).sum(-1)                              # mean square above cutoff (n, 4)
     return {"success": success, "failed": failed, "err_tail": err_tail, "max_tilt": max_tilt,
-            "settle": last_bad, "hf_thrust": torch.from_numpy(np.sqrt(hf_ms[:, 0])).float(),
+            "settle": last_bad, "trip": trip, "hf_thrust": torch.from_numpy(np.sqrt(hf_ms[:, 0])).float(),
             "hf_rates": torch.from_numpy(np.sqrt(hf_ms[:, 1:].mean(-1))).float()}
 
 
@@ -247,6 +268,7 @@ def summarize(res, groups):
         surv = ~res["failed"][s]
         d = {"n": int(ok.numel()), "success": ok.float().mean().item(),
              "crash": res["failed"][s].float().mean().item(),
+             "trip": res["trip"][s].float().mean().item(),
              "worst_tilt": res["max_tilt"][s][surv].max().item() if surv.any() else float("nan"),
              "p95_tilt": res["max_tilt"][s][surv].quantile(0.95).item() if surv.any() else float("nan"),
              "err_med": res["err_tail"][s][surv].median().item() if surv.any() else float("nan"),
@@ -257,12 +279,13 @@ def summarize(res, groups):
     return out
 
 
-def evaluate(controllers: dict, n=512, n_ext=64, seed=123, extremes=True, scenarios=SCENARIOS, threads=4):
+def evaluate(controllers: dict, n=512, n_ext=64, seed=123, extremes=True, scenarios=SCENARIOS, threads=4,
+             sensing: str = "v1"):
     """controllers: {name: factory(num_envs, nominal) -> ctrl}. Returns {name: {group: metrics}}."""
     torch.set_num_threads(threads)
     results = {}
     for name, factory in controllers.items():
-        env, groups, nominal = build(n, n_ext, seed, extremes, scenarios)
+        env, groups, nominal = build(n, n_ext, seed, extremes, scenarios, sensing)
         ctrl = factory(env.n, nominal)
         results[name] = summarize(rollout(env, ctrl), groups)
     return results
@@ -284,15 +307,17 @@ def format_tables(results: dict, ref: str = "PID") -> str:
         f"{nm} err_med m" for nm in names) + " | " + " | ".join(
         f"{nm} worst/p95 tilt°" for nm in names) + " | " + " | ".join(
         f"{nm} settle s" for nm in names) + " | " + " | ".join(
+        f"{nm} trip%" for nm in names) + " | " + " | ".join(
         f"{nm} HF rate/thr" for nm in names) + " |"
     lines.append(hdr)
-    lines.append("|" + "---|" * (1 + 5 * len(names)))
+    lines.append("|" + "---|" * (1 + 6 * len(names)))
     for g in main_groups:
         row = [g]
         row += [_f(100 * results[nm][g]["success"], ".1f") for nm in names]
         row += [_f(results[nm][g]["err_med"], ".3f") for nm in names]
         row += [f"{_f(results[nm][g]['worst_tilt'], '.0f')}/{_f(results[nm][g]['p95_tilt'], '.0f')}" for nm in names]
         row += [_f(results[nm][g]["settle_mean"], ".2f") for nm in names]
+        row += [_f(100 * results[nm][g].get("trip", float("nan")), ".1f") for nm in names]
         row += [f"{_f(results[nm][g]['hf_rates'], '.4f')}/{_f(results[nm][g]['hf_thrust'], '.4f')}" for nm in names]
         lines.append("| " + " | ".join(row) + " |")
     if ext_groups:
@@ -324,6 +349,11 @@ def main(argv=None):
     ap.add_argument("--seed", type=int, default=123)
     ap.add_argument("--no-extremes", action="store_true")
     ap.add_argument("--threads", type=int, default=4)
+    ap.add_argument("--sensing", choices=sorted(SENSING), default="v1",
+                    help="v1: training env of hover_ctbr_v1 (raw gyro, truth+noise pos/vel); "
+                         "fw: firmware sensing path (filtered gyro, flow/ToF KF)")
+    ap.add_argument("--compare", nargs="*", default=[], metavar="NAME=POLICY",
+                    help="extra policies to evaluate side by side, e.g. v1=train/policies/hover_ctbr_v1.nfpol.json")
     ap.add_argument("--md", default=None, help="write the table to this markdown file")
     ap.add_argument("--json", default=None, help="write raw metrics as JSON")
     a = ap.parse_args(argv)
@@ -331,8 +361,11 @@ def main(argv=None):
     if a.policy:
         pol = TorchPolicy(a.policy)
         ctrls["RL"] = lambda n, nom: pol
+    for spec in a.compare:
+        nm, path = spec.split("=", 1)
+        ctrls[nm] = (lambda pp: (lambda n, nom: pp))(TorchPolicy(path))
     ctrls["PID"] = make_pid
-    res = evaluate(ctrls, a.n, a.n_ext, a.seed, not a.no_extremes, threads=a.threads)
+    res = evaluate(ctrls, a.n, a.n_ext, a.seed, not a.no_extremes, threads=a.threads, sensing=a.sensing)
     table = format_tables(res)
     print(table)
     if a.md:

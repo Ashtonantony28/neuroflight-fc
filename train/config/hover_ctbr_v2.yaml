@@ -1,0 +1,93 @@
+# PPO fine-tuning stage for CTBR hover / recovery. Read by train/ppo.py.
+run_name: hover_ctbr_v2
+# hover_ctbr_v2: fine-tune hover_ctbr_v1 (runs/v3_ft3/last.pt) on the FIRMWARE sensing path
+# (sim/fw_estimator.py: filtered + bias-corrected gyro for rate PID and obs, flow/ToF KF
+# position/velocity, 1 deg attitude misalignment) with supervisor-envelope shaping
+# (TILT_PREDICTED / TILT margins), a sharper position bonus against v1's 6 cm offset, and
+# hover heights down to the 0.8 m (SITL flies at 1 m; the flow/gyro coupling scales with h).
+#   python -m train.ppo --config train/config/hover_ctbr_v2.yaml --name v2 --init-from runs/v3_ft3/last.pt
+init_level: 4
+seed: 0
+threads: 4
+randomization: config/randomization.yaml   # domain randomization ON (use_nominal: false)
+reward_scale: 0.02                         # applied to env reward before GAE
+log_every: 10
+checkpoint_every: 50
+
+env:
+  num_envs: 2048
+  use_nominal: false
+  episode_len_s: 3.0          # shorter than eval (5 s) => more resets; timeouts are bootstrapped
+  randomize_initial_time: true
+  target_xy: 1.0
+  target_z: [0.8, 2.2]
+  init_min_z: 0.5
+  gyro_filter: true
+  gyro_bias_resid_std: 0.001
+  estimator: true
+  att_misalign_deg: 1.0
+  oob_dist: 3.0
+  max_rate_term: 40.0
+
+reward_weights:               # see sim/env.py DEFAULT_REWARD_WEIGHTS for the terms
+  alive: 5.0                  # large enough that surviving is always better than crashing early
+  pos: 3.0
+  vel: 0.5
+  upright: 1.0
+  rate: 0.02
+  yaw_rate: 0.02
+  action: 0.02
+  smooth: 1.0
+  crash: 100.0
+  tilt_pred: 100.0            # * rad over (tilt + 0.1 s rate) = 50 deg, faded in at 2.5-4 rad/s tilt rate (stage 1: 30)
+  tilt_excess: 10.0           # * rad over 55 deg
+  thrust_smooth: 2.0
+  est_innov: 15.0             # * rad over 0.25 of the 1 Hz-low-passed tilt, only while |omega| < 2 rad/s (Mahony-innovation proxy; ESTIMATOR trips at 0.35 rad), stage 3 only
+
+# linear schedules (by iteration) for reward weights, applied on top of reward_weights
+reward_ramp: {}
+
+# training-side shaping added by train/priv_env.py (not part of the sim reward)
+extra_reward:
+  pos_exp: {weight: 3.0, sigma: 0.15}
+  pos_exp2: {weight: 3.0, sigma: 0.04}
+
+model:
+  actor_hidden: [64, 64]
+  critic_hidden: [128, 128]
+  hover_bias_init: true       # thrust output bias -> nominal hover collective
+
+reset_log_std: true          # re-open exploration (v1 ended at std 0.05) for the new sensing path
+
+ppo:
+  iterations: 2000
+  rollout_steps: 64
+  epochs: 4
+  minibatches: 4
+  gamma: 0.997                # 500 Hz control: ~0.7 s horizon
+  lam: 0.99                   # GAE horizon ~100 steps (0.2 s); 0.97 was too myopic at 500 Hz
+  clip: 0.2
+  lr: 2.0e-4
+  kl_target: 0.01
+  lr_min: 1.0e-5
+  lr_max: 5.0e-4
+  vf_coef: 1.0
+  value_clip: false           # returns are O(50): PPO value clipping (0.2) stalls the critic
+  ent_coef: 0.0
+  max_grad_norm: 1.0
+  init_log_std: -2.3
+  min_log_std: -3.0
+
+# Initial-state curriculum (EnvConfig fields). Advance when the EMA of the
+# fraction of episodes that end by timeout (not crash/OOB) >= advance_success.
+# Tilt is uniform in [0, max]; init vel/rate uniform per axis in [-v, v].
+curriculum:
+  ema: 0.9
+  advance_success: 0.9
+  min_iters: 40
+  levels:
+    - {init_max_tilt_deg: 15,  init_pos_offset: 0.3, init_max_vel: 0.3, init_max_rate: 0.5, init_upside_down_prob: 0.0}
+    - {init_max_tilt_deg: 45,  init_pos_offset: 0.7, init_max_vel: 1.0, init_max_rate: 2.0, init_upside_down_prob: 0.0}
+    - {init_max_tilt_deg: 75,  init_pos_offset: 1.0, init_max_vel: 1.5, init_max_rate: 4.0, init_upside_down_prob: 0.0}
+    - {init_max_tilt_deg: 100, init_pos_offset: 1.0, init_max_vel: 2.0, init_max_rate: 7.0, init_upside_down_prob: 0.1}
+    - {init_max_tilt_deg: 120, init_pos_offset: 1.0, init_max_vel: 2.5, init_max_rate: 10.0, init_upside_down_prob: 0.2}

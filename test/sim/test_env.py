@@ -9,7 +9,8 @@ from sim.rotations import quat_from_axis_angle
 
 
 def test_obs_layout_matches_spec():
-    env = QuadEnv(EnvConfig(num_envs=8, seed=1, use_nominal=True, randomize_initial_time=False))
+    # raw-gyro path (gyro_filter=False) so obs 12-14 are exactly omega (no filter lag)
+    env = QuadEnv(EnvConfig(num_envs=8, seed=1, use_nominal=True, randomize_initial_time=False, gyro_filter=False))
     obs = env.reset()
     assert obs.shape == (8, OBS_DIM) and obs.dtype == torch.float32
     q = env.quad

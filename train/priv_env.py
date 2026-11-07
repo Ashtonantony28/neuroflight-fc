@@ -11,6 +11,8 @@
   `pos_exp: {weight, sigma}` adds weight * exp(-(dist/sigma)^2), a bonus that
   is sharp near the target (the env's linear |p - p_target| term alone left a
   ~0.3 m steady-state offset). Uses info["dist"], i.e. the pre-reset state.
+  `pos_exp2: {weight, sigma}`: a second, sharper bonus of the same form
+  (hover_ctbr_v2: sigma 0.04 m against v1's ~6 cm steady-state offset).
 
 The critic input is `cat(actor_obs, privileged)`.
 """
@@ -70,7 +72,8 @@ class PrivilegedQuadEnv(QuadEnv):
             self._capture = False
         if "terminal_obs" in info:
             info["terminal_priv"] = self._term_priv.clone()
-        pe = self.extra_reward.get("pos_exp")
-        if pe and float(pe["weight"]) != 0.0:
-            rew = rew + float(pe["weight"]) * torch.exp(-(info["dist"] / float(pe["sigma"])) ** 2)
+        for key in ("pos_exp", "pos_exp2"):
+            pe = self.extra_reward.get(key)
+            if pe and float(pe["weight"]) != 0.0:
+                rew = rew + float(pe["weight"]) * torch.exp(-(info["dist"] / float(pe["sigma"])) ** 2)
         return obs, rew, done, info

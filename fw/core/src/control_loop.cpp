@@ -199,7 +199,17 @@ MotorOutput ControlLoop::step(const ImuSample& imu, const SensorSample& sens, co
   si.imu_b_valid = imu.b_valid;
   if (armed_ && sup_.mode() == FlightMode::POLICY && tick) {
     uint32_t t0 = c_.clock_us ? c_.clock_us() : 0;
-    bool ok = policy_crc_ok_ && policy_.run(state_, target_, action_);
+    bool ok;
+    if (ovr_ && ovr_->mask) {
+      VehicleState ps = state_;
+      if (ovr_->mask & InputOverride::POLICY_Q) ps.q = ovr_->q;
+      if (ovr_->mask & InputOverride::POLICY_OMEGA) ps.omega = ovr_->omega_policy;
+      if (ovr_->mask & InputOverride::POLICY_POS) ps.pos = ovr_->pos;
+      if (ovr_->mask & InputOverride::POLICY_VEL) ps.vel = ovr_->vel;
+      ok = policy_crc_ok_ && policy_.run(ps, target_, action_);
+    } else {
+      ok = policy_crc_ok_ && policy_.run(state_, target_, action_);
+    }
     uint32_t t1 = c_.clock_us ? c_.clock_us() : 0;
     inference_us_ = t1 - t0;
     si.policy_ran = ok;
@@ -234,7 +244,8 @@ MotorOutput ControlLoop::step(const ImuSample& imu, const SensorSample& sens, co
   const bool flying = armed_ && (mode == FlightMode::POLICY || fallback);
   if (flying) {
     if (ctbr_.thrust_n < c_.min_thrust_for_i * c_.cascade.mass * c_.cascade.gravity) pid_.reset();
-    Vec3 tau = pid_.update(ctbr_.rate_sp, state_.omega);
+    const bool pid_ovr = ovr_ && (ovr_->mask & InputOverride::PID_OMEGA) && mode == FlightMode::POLICY;
+    Vec3 tau = pid_.update(ctbr_.rate_sp, pid_ovr ? ovr_->omega_pid : state_.omega);
     mix_ = mixer_.mix(ctbr_.thrust_n, tau);
     pid_.integrate(mix_.any_saturated());
     for (int i = 0; i < 4; ++i) out.cmd[i] = mix_.cmd[i];

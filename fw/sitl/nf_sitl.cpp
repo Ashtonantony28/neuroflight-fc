@@ -20,9 +20,21 @@ struct OwnedModel {
   FloatModel m{};
 };
 
+struct OwnedI8Model {
+  std::vector<float> mean, stdv;
+  std::vector<std::vector<int8_t>> W, lut;
+  std::vector<std::vector<int32_t>> b, M;
+  std::vector<std::vector<uint8_t>> S;
+  std::vector<std::vector<float>> s_w;
+  std::vector<Int8Layer> layers;
+  Int8Model m{};
+};
+
 struct Env {
   ControlLoop loop;
   std::unique_ptr<OwnedModel> model;
+  std::unique_ptr<OwnedI8Model> model_i8;
+  InputOverride ovr{};
   uint32_t clk = 0;        // simulated microsecond clock for inference timing
   uint32_t inject_us = 0;  // simulated inference duration
 };
@@ -65,6 +77,14 @@ struct Ctbr {
 };
 struct CtbrBank {
   std::vector<Ctbr> v;
+};
+
+struct GyroChain {
+  BiquadLpfVec3 lpf;
+  RpmNotchBank rpm;
+};
+struct GyroChainBank {
+  std::vector<GyroChain> v;
 };
 }  // namespace
 
@@ -126,6 +146,7 @@ NF_API int32_t nf_sitl_set_policy_f32(void* h, int32_t env, int32_t n_layers, co
     m->m.crc32 = policy_crc32(m->m);
     if (crc_out) *crc_out = m->m.crc32;
     e.model = std::move(m);
+    e.model_i8.reset();
     e.loop.set_policy(&e.model->m);
     if (!e.loop.policy_ok()) all_ok = 0;
   });
@@ -136,7 +157,81 @@ NF_API void nf_sitl_clear_policy(void* h, int32_t env) {
   for_envs(h, env, [](Env& e) {
     e.loop.set_policy(static_cast<const FloatModel*>(nullptr));
     e.model.reset();
+    e.model_i8.reset();
   });
+}
+
+NF_API int32_t nf_sitl_set_policy_i8(void* h, int32_t env, int32_t n_layers, const int32_t* dims, const float* mean,
+                                     const float* stdv, float s_in, const int8_t* Wq, const int32_t* bq,
+                                     const float* s_w, const int32_t* M, const int32_t* S, const int8_t* lut,
+                                     const float* s_x, const float* s_pre, uint32_t* crc_out) {
+  (void)s_pre;  // folded into M/S/lut by the quantizer
+  if (!h || n_layers <= 0 || !dims || !mean || !stdv || !Wq || !bq || !s_w || !s_x) return 0;
+  int32_t all_ok = 1;
+  for_envs(h, env, [&](Env& e) {
+    auto m = std::make_unique<OwnedI8Model>();
+    m->mean.assign(mean, mean + dims[0]);
+    m->stdv.assign(stdv, stdv + dims[0]);
+    const size_t L = static_cast<size_t>(n_layers);
+    m->W.resize(L); m->b.resize(L); m->M.resize(L); m->S.resize(L); m->lut.resize(L); m->s_w.resize(L);
+    const int8_t* wp = Wq;
+    const int32_t* bp = bq;
+    const float* sp = s_w;
+    const int32_t* mp = M;
+    const int32_t* shp = S;
+    const int8_t* lp = lut;
+    for (size_t l = 0; l < L; ++l) {
+      const size_t in = static_cast<size_t>(dims[l]), out = static_cast<size_t>(dims[l + 1]);
+      m->W[l].assign(wp, wp + in * out);
+      m->b[l].assign(bp, bp + out);
+      wp += in * out;
+      bp += out;
+      if (l + 1 < L) {
+        m->M[l].assign(mp, mp + out);
+        for (size_t j = 0; j < out; ++j) m->S[l].push_back(static_cast<uint8_t>(shp[j]));
+        m->lut[l].assign(lp, lp + 256);
+        mp += out;
+        shp += out;
+        lp += 256;
+      } else {
+        m->s_w[l].assign(sp, sp + out);
+      }
+      sp += out;
+    }
+    for (size_t l = 0; l < L; ++l) {
+      const bool last = l + 1 == L;
+      Int8Layer IL{static_cast<uint16_t>(dims[l]), static_cast<uint16_t>(dims[l + 1]), m->W[l].data(),
+                   m->b[l].data(), last ? nullptr : m->M[l].data(), last ? nullptr : m->S[l].data(),
+                   last ? nullptr : m->lut[l].data(), last ? m->s_w[l].data() : nullptr};
+      m->layers.push_back(IL);
+    }
+    m->m = Int8Model{static_cast<uint16_t>(dims[0]), static_cast<uint16_t>(dims[n_layers]),
+                     static_cast<uint16_t>(n_layers), m->mean.data(), m->stdv.data(), m->layers.data(),
+                     s_in, s_x[n_layers - 1], 0};
+    m->m.crc32 = policy_crc32(m->m);
+    if (crc_out) *crc_out = m->m.crc32;
+    e.model_i8 = std::move(m);
+    e.model.reset();
+    e.loop.set_policy(&e.model_i8->m);
+    if (!e.loop.policy_ok()) all_ok = 0;
+  });
+  return all_ok;
+}
+
+NF_API void nf_sitl_set_overrides(void* h, const uint32_t* mask, const float* vals) {
+  Bank* b = bank(h);
+  if (!b) return;
+  for (size_t k = 0; k < b->envs.size(); ++k) {
+    Env& e = *b->envs[k];
+    const float* v = vals + k * NF_OVR_F;
+    e.ovr.mask = mask[k];
+    e.ovr.q = Quat{v[0], v[1], v[2], v[3]};
+    e.ovr.omega_policy = v3(v + 4);
+    e.ovr.omega_pid = v3(v + 7);
+    e.ovr.pos = v3(v + 10);
+    e.ovr.vel = v3(v + 13);
+    e.loop.set_input_override(e.ovr.mask ? &e.ovr : nullptr);
+  }
 }
 
 NF_API int32_t nf_sitl_poke_policy(void* h, int32_t env, int32_t layer, int32_t which, int32_t index, float value) {
@@ -155,6 +250,7 @@ NF_API int32_t nf_sitl_policy_forward(void* h, int32_t env, const float* obs, fl
   int32_t ok = 0;
   for_envs(h, env, [&](Env& e) {
     if (e.model) ok = mlp_forward(e.model->m, obs, out) ? 1 : 0;
+    else if (e.model_i8) ok = mlp_forward_int8(e.model_i8->m, obs, out) ? 1 : 0;
   });
   return ok;
 }
@@ -221,6 +317,8 @@ NF_API void nf_sitl_step(void* h, uint64_t now_us, const float* in_f, const int3
     }
     of[NF_OUT_THRUST] = e.loop.last_ctbr().thrust_n;
     for (int i = 0; i < 4; ++i) of[NF_OUT_ACTION + i] = e.loop.last_action()[i];
+    of[NF_OUT_ACC_INNOV] = e.loop.attitude().innovation();
+    of[NF_OUT_KF_NIS] = e.loop.translation().nis();
     ou[NF_OUT_ARMED] = o.armed ? 1u : 0u;
     ou[NF_OUT_MODE] = static_cast<uint32_t>(o.mode);
     ou[NF_OUT_ACTIVE_FAULTS] = o.active_faults;
@@ -267,5 +365,32 @@ NF_API void nf_ctbr_step(void* h, const float* action, const float* gyro, float*
     if (sat) sat[k] = r.any_saturated() ? 1 : 0;
     if (torque)
       for (int i = 0; i < 3; ++i) torque[3 * k + i] = tau[i];
+  }
+}
+
+// ------------------------------------------------------------------ gyro filter parity
+NF_API void* nf_gfilt_create(int32_t n, int32_t rate_hz) {
+  if (n <= 0) return nullptr;
+  GyroChainBank* b = new GyroChainBank;
+  b->v.resize(static_cast<size_t>(n));
+  const ControlLoopConfig c{};
+  const float fs = static_cast<float>(rate_hz > 0 ? rate_hz : c.rate_hz);
+  for (auto& g : b->v) {
+    g.lpf.init(c.gyro_lpf_hz, fs);
+    g.rpm.init(fs);
+  }
+  return b;
+}
+
+NF_API void nf_gfilt_destroy(void* h) { delete static_cast<GyroChainBank*>(h); }
+
+NF_API void nf_gfilt_step(void* h, const float* gyro, const float* motor_hz, float* out) {
+  if (!h) return;
+  auto& v = static_cast<GyroChainBank*>(h)->v;
+  for (size_t k = 0; k < v.size(); ++k) {
+    v[k].rpm.update(motor_hz + 4 * k);  // ControlLoop::step order: rpm update, LPF, notches
+    Vec3 g = v[k].lpf.apply(v3(gyro + 3 * k));
+    g = v[k].rpm.apply(g);
+    for (int i = 0; i < 3; ++i) out[3 * k + i] = g[i];
   }
 }

@@ -67,6 +67,9 @@ def main():
     L = []
     w = L.append
     trained = S.trained_policy()
+    v2 = S.trained_policy(S.TRAINED_POLICY_V2)
+    v2q_path = S.TRAINED_POLICY_V2.replace(".nfpol.json", ".q.nfpol.json")
+    v2q = sitl.load_nfpol(v2q_path) if os.path.exists(v2q_path) else None
 
     print("hover ...")
     hov = [S.fallback_hover(1), S.fallback_hover(nr, randomize=True, seed=1),
@@ -76,7 +79,33 @@ def main():
              S.policy_hover(sitl.linear_hover_policy(), n=4, randomize=True, seed=11, name="synthetic linear policy")]
     if trained is not None:
         pol_h += [S.policy_hover(trained, name="trained hover_ctbr_v1"),
-                  S.policy_hover(trained, n=4, randomize=True, seed=11, name="trained hover_ctbr_v1")]
+                  S.policy_hover(trained, n=nr, randomize=True, seed=11, name="trained hover_ctbr_v1")]
+    if v2 is not None:
+        pol_h += [S.policy_hover(v2, name="trained hover_ctbr_v2"),
+                  S.policy_hover(v2, n=nr, randomize=True, seed=11, name="trained hover_ctbr_v2")]
+    if v2q is not None:
+        pol_h += [S.policy_hover(v2q, n=nr, randomize=True, seed=11, name="hover_ctbr_v2 int8 (nf::Int8Model)", int8=True)]
+    print("policy disturbances ...")
+    dist = []
+    for label, pol, i8 in (("hover_ctbr_v1", trained, False), ("hover_ctbr_v2", v2, False), ("hover_ctbr_v2 int8", v2q, True)):
+        if pol is None:
+            continue
+        for kind in ("tilt", "throw"):
+            dist.append((label, kind, S.policy_disturbance(pol, kind, n=nr, seed=21, int8=i8)))
+    if v2 is not None:
+        dist.append(("hover_ctbr_v2", "throw, |dw| <= 10 rad/s (stress, informational)",
+                     S.policy_disturbance(v2, "throw", n=nr, seed=21, throw_dw_max=10.0)))
+    print("gap attribution ...")
+    import diagnose_gap as DG
+    gap_rows = []
+    for label, pol in (("hover_ctbr_v1", trained), ("hover_ctbr_v2", v2)):
+        if pol is None:
+            continue
+        for name, m in (("firmware as is", 0), ("training-env inputs (ALL)", DG.ALL), ("firmware + true velocity (V)", DG.BITS["V"]),
+                        ("ALL - V (firmware velocity only)", DG.ALL & ~DG.BITS["V"]), ("firmware + true attitude (Q)", DG.BITS["Q"]),
+                        ("firmware + raw gyro to PID (PID)", DG.BITS["PID"]), ("firmware + raw gyro obs (W)", DG.BITS["W"]),
+                        ("firmware + true position (P)", DG.BITS["P"])):
+            gap_rows.append((label, name, DG.run(pol, m, nr, 11)))
     print("bad policies ...")
     bad = S.bad_policy_flight()
     print("faults ...")
@@ -90,7 +119,9 @@ def main():
     par = S.ctbr_parity_random()
     par_cl = S.ctbr_parity_closed_loop()
     par_env = S.ctbr_parity_random(sim_reset_with_gyro=False)
-    gap = S.ctbr_full_loop_gap()
+    gfp = S.gyro_filter_parity()
+    gap_raw = S.ctbr_full_loop_gap(sim_filter=False)
+    gap = S.ctbr_full_loop_gap(sim_filter=True)
 
     w("# SITL report (WS6)\n")
     w(f"Generated {dt.datetime.now().strftime('%Y-%m-%d %H:%M')} by `python fw/sitl/report.py"
@@ -99,8 +130,9 @@ def main():
       "(sim latency + motor lag per vehicle). The sensors are IMU A and IMU B at 1 kHz, and ToF and optical flow at 100 Hz. "
       f"Each run starts with the vehicle powered on and still on the ground for {S.POWER_ON_S:.0f} s. It is then armed into FALLBACK_HOLD and takes off to 1 m. "
       f"Policy runs switch to POLICY with the RC re-engage at t={S.T_POLICY:.0f} s, and faults are injected at t={S.T_FAULT:.0f} s.\n")
-    w(f"Trained policy `{os.path.relpath(S.TRAINED_POLICY, sitl.ROOT)}`: "
-      f"{'present' if trained is not None else '**not present** (trained-policy rows skipped)'}.\n")
+    for path, pol in ((S.TRAINED_POLICY, trained), (S.TRAINED_POLICY_V2, v2), (v2q_path, v2q)):
+        w(f"Trained policy `{os.path.relpath(path, sitl.ROOT)}`: "
+          f"{'present' if pol is not None else '**not present** (rows skipped)'}.\n")
 
     w("## (a) Fallback controller: takeoff and 10 s hover at 1 m\n")
     w(f"Pass = 3D RMS error < {S.HOVER_TOL_M * 100:.0f} cm over the 10 s window, no faults, no crash. "
@@ -126,6 +158,39 @@ def main():
     w("\nThe synthetic linear policy is a hand-built single tanh layer: PD on the §4 observation. It stands in for a "
       "trained policy and carries the fault injection. On randomized vehicles it is calibrated with the true mass "
       "and thrust, because it has no integrator.\n")
+    w("hover_ctbr_v1 was trained on true attitude/velocity (+ white noise) and the raw gyro; hover_ctbr_v2 on the firmware sensing "
+      "path (sim/fw_estimator.py). The int8 row flies the quantized v2 through the firmware's int8 inference "
+      "(`nf_sitl_set_policy_i8` -> `nf::Int8Model`).\n")
+    if dist:
+        w("### Policy recovery from disturbances (randomized vehicles)\n")
+        w(f"At t = {S.T_DIST:.0f} s, 3 s after the POLICY engage. **tilt**: an external 'hand' holds the vehicle in place and rotates it "
+          f"about a random horizontal axis at {S.TILT_DIST_RATE} rad/s to {S.TILT_DIST_DEG} deg, then releases it at rest (gyro and "
+          f"accelerometer see the motion; both envelope monitors stay quiet during the hold: tilt < 60.16 deg, rate < 4 rad/s). "
+          f"**throw**: a {S.THROW_PUSH_S * 1000:.0f} ms push, |dv| U[0, {S.THROW_DV_MAX:g}] m/s and |dw| U[0, {S.THROW_DW_MAX:g}] rad/s "
+          "in random directions (accelerometer sees the push force). With |dw| <= 5 rad/s the push alone cannot meet TILT_PREDICTED "
+          "(tilt + 0.1 s * rate < 60 deg), so any trip is the policy's. Pass = never leaves POLICY, no supervisor fault, no crash, "
+          "back within 0.15 m / 10 deg for the last 2 s. Recovery = time after the release until |p - target| < 0.2 m and tilt < 15 deg for good.\n")
+        w("| policy | disturbance | pass | trips | max tilt med / max (deg) | recovery med / max (s) | peak err med (m) | RMS last 3 s med (cm) |")
+        w("|---|---|---|---|---|---|---|---|")
+        for label, kind, r in dist:
+            trips = sorted({f for b in r.fault_history for f in sitl.fault_names(int(b))})
+            nt = int((r.fault_history != 0).sum())
+            w(f"| {label} | {kind} | {int(r.passed.sum())}/{len(r.passed)} | {nt} {'(' + ','.join(trips) + ')' if trips else ''} | "
+              f"{np.median(r.max_tilt_deg):.0f} / {r.max_tilt_deg.max():.0f} | {np.nanmedian(r.recover_s):.2f} / {np.nanmax(r.recover_s):.2f} | "
+              f"{np.median(r.peak_err_m):.2f} | {cm(np.median(r.rms_after_m))} |")
+        w("")
+    if gap_rows:
+        w("### Sim-to-real gap attribution (`fw/sitl/diagnose_gap.py`)\n")
+        w(f"POLICY hover, {nr} randomized vehicles (seed 11). `nf::InputOverride` (diagnostics only) replaces selected policy / rate-PID "
+          "inputs with what the v1 training env fed: Q = true attitude, W = raw gyro as obs 12-14, P / V = true position / velocity + white "
+          "noise, PID = raw gyro into the rate PID. RMS error is the true 3D error over 10 s. 'offset' = |mean position - target|.\n")
+        w("| policy | inputs | RMS err min / med / max (cm) | med offset (cm) | max tilt (deg) | trips |")
+        w("|---|---|---|---|---|---|")
+        for label, name, d in gap_rows:
+            r_ = d["rms"] * 100
+            w(f"| {label} | {name} | {r_.min():.1f} / {np.median(r_):.1f} / {r_.max():.1f} | {np.median(d['offset']) * 100:.1f} | "
+              f"{d['max_tilt'].max():.0f} | {int(d['trips'].sum())} |")
+        w("")
     w("Deliberately bad policies (random weights, 19-64-64-4, std 1), engaged at hover:\n")
     w("| seed | first fault | entered | latency (ms) | alt lost (m) | final | pass |")
     w("|---|---|---|---|---|---|---|")
@@ -158,12 +223,17 @@ def main():
       f"{par['max_abs']:.2e} | {par['mean_abs']:.1e} | sat-flag mismatch {par['sat_flag_mismatch_frac']:.0%} |")
     w(f"| closed loop (sim env + PID baseline, randomized, tilted/rotating starts), 16 x 4000 | {par_cl['max_abs']:.2e} | "
       f"{par_cl['mean_abs']:.1e} | |")
-    w(f"| same random stress, but sim reset as `sim/env.py` does it (no gyro) | {par_env['max_abs']:.3f} | "
+    w(f"| same random stress, `RateController.reset` without a measurement (old sim/env.py reset; env fixed, FOLLOWUPS 1) | {par_env['max_abs']:.3f} | "
       f"{par_env['mean_abs']:.1e} | first step {par_env['first_step_max_abs']:.3f}; {par_env['frac_gt_tol']:.0%} of samples > tol |")
-    w(f"| full firmware loop vs sim/ctbr.py on raw gyro (informational) | {gap['max_abs']:.4f} | rms {gap['rms']:.4f} | "
-      f"gyro noise std {gap['gyro_noise_std']:.3f} rad/s |")
-    w("\nThe last row shows the input-side gap. The firmware rate PID sees the gyro after a 150 Hz biquad, the RPM notches and "
-      "Mahony bias correction. Training feeds the raw noisy gyro to the PID.\n")
+    w(f"| gyro filter chain: sim/fw_estimator.GyroFilterChain vs firmware LPF + RPM notches (rad/s), 32 x 5000 | {gfp['max_abs']:.1e} | | "
+      f"{gfp['notch_toggles']} notch (de)activations |")
+    w(f"| full firmware loop vs sim measurement path + sim/ctbr.py (whole armed flight replayed) | {gap['max_abs']:.1e} | rms {gap['rms']:.1e} | "
+      f"Mahony bias drift {gap['bias_drift']:.1e} rad/s (replay uses a constant bias) |")
+    w(f"| same, raw gyro into sim/ctbr.py (v1 training path) | {gap_raw['max_abs']:.4f} | rms {gap_raw['rms']:.4f} | "
+      f"gyro noise std {gap_raw['gyro_noise_std']:.3f} rad/s |")
+    w("\nSince hover_ctbr_v2 the sim feeds the rate PID (and obs 12-14) the firmware's measurement: 150 Hz biquad -> RPM notches -> "
+      "minus the bias estimate (INTERFACES §9). The env reset seeds the PID with the first measurement "
+      "(`test_sim_env_inner_loop_matches_firmware_from_reset`: every command within 1e-5 from the first step).\n")
 
     w("## Findings\n")
     w("1. **Fixed in fw/core (one line, `ControlLoop::do_arm`)**: arming kept the translation-KF velocity. On the ground "
@@ -181,9 +251,10 @@ def main():
       "(gyro/accel standard deviation, mean gyro and |g| gates, plus gross-motion gates on every sample) are averaged. The "
       "result seeds the Mahony bias. Arming is refused (ARM_FAIL_GYRO_CAL / ARM_FAIL_MOTION) until a still window completes, "
       "and again after any motion. See row 3 of (a).")
-    w("4. **sim/env.py resets RateController without the gyro**, so the first step gets a D-term kick (table (e)). "
-      "The firmware seeds the previous measurement with the first sample. (Open: FOLLOWUPS #1, sim/ is owned elsewhere.)")
-    w("5. **Filter path in §9**: the firmware PID input is filtered and bias-corrected; the sim uses the raw gyro (table (e), last row). (Open: FOLLOWUPS #2.)")
+    w("4. **Fixed (FOLLOWUPS #1): sim/env.py seeds the rate PID on reset** with the first measurement, like the firmware "
+      "(`QuadEnv.reinit_sensing`, also used by train/eval.py). Was a D-term kick of up to 0.22 in motor command on every episode start.")
+    w("5. **Fixed (FOLLOWUPS #2): one filter path in §9.** The sim rate PID and obs 12-14 use the firmware's filtered, bias-corrected "
+      "gyro (`sim/fw_estimator.GyroFilterChain`, bit-level parity in table (e)). Full-loop replay gap 0.035 -> <1e-4.")
     w(f"6. **Fixed (FOLLOWUPS #5): flips are caught early.** A new POLICY-only monitor, TILT_PREDICTED, trips when the tilt rate is at least 4 rad/s "
       f"and tilt + tilt_rate * 0.1 s > 60 deg for 20 ms. Before, the TILT monitor (60 deg + 50 ms) handed over at about 94 deg, the tilt peaked "
       f"at 110 deg and the vehicle lost 0.63 m. Now the switch-over tilt is {fn.switch_tilt_deg:.0f} deg nominal / {fr.switch_tilt_deg:.0f} deg randomized, "
@@ -192,6 +263,11 @@ def main():
     w(f"7. **Fixed (FOLLOWUPS #6): bumpless fallback handover.** The loop keeps a hover-thrust estimate, a 0.5 Hz low-pass of "
       f"g * T_alloc / f_bz while flying near level. On handover from POLICY it preloads the cascade's vertical velocity integrator with it, "
       f"instead of starting from nominal weight. Altitude lost in the randomized NaN case was 0.348 m before and is {nr_.alt_lost_m:.3f} m now.")
+    w("8. **hover_ctbr_v1 -> v2 (sim-to-real gap).** The gap-attribution table shows the firmware's flow/ToF KF velocity is the "
+      "dominant gap for v1: its error is coloured (autocorrelation 0.66 at 10 ms, ~0 at 50 ms, rms ~0.6 x vel_noise_std) and "
+      "the policy, trained on white per-step noise, answers it with 20-37 deg tilts and TILT_PREDICTED trips; true attitude, "
+      "gyro path and position matter little. v2 is trained on a port of the firmware sensing path "
+      "(sim/fw_estimator.py: gyro filter chain + TranslationKf with SITL-identical range/flow) plus supervisor-envelope shaping.")
     open(OUT, "w").write("\n".join(L) + "\n")
     print(f"wrote {OUT} in {time.time() - t0:.0f} s")
 

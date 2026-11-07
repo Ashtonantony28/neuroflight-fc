@@ -22,6 +22,7 @@ from sitl import (calibrated_nominal, CONTROLLED_DESCENT, FALLBACK_HOLD, FAULT, 
                   random_policy, standard_script, tilt_of_quat)
 
 TRAINED_POLICY = os.path.join(ROOT, "train", "policies", "hover_ctbr_v1.nfpol.json")
+TRAINED_POLICY_V2 = os.path.join(ROOT, "train", "policies", "hover_ctbr_v2.nfpol.json")
 # Long stationary power-on for the reference runs. Since the at-rest gyro
 # calibration (nf::GyroCalibrator) the firmware can also arm ~2 s after
 # power-on (see test_arm_2s_after_power_on_and_hover_20_randomized).
@@ -88,9 +89,9 @@ def _calibrate(r: SitlRunner):
 
 
 def policy_hover(policy: dict, n: int = 1, randomize: bool = False, seed: int = 0, name: str = "policy",
-                 power_on_s: float = POWER_ON_S, hold_s: float = 10.0) -> HoverResult:
+                 power_on_s: float = POWER_ON_S, hold_s: float = 10.0, int8: bool = False) -> HoverResult:
     """(b) take off in FALLBACK_HOLD, switch to POLICY at T_POLICY, hover `hold_s`."""
-    r = SitlRunner(n, randomize=randomize, seed=seed, policy=policy, log_decimate=5)
+    r = SitlRunner(n, randomize=randomize, seed=seed, policy=policy, log_decimate=5, int8=int8)
     assert r.policy_ok, "firmware rejected the policy"
     if randomize and (policy.get("meta") or {}).get("name") == "linear_hover":
         _calibrate(r)
@@ -99,6 +100,144 @@ def policy_hover(policy: dict, n: int = 1, randomize: bool = False, seed: int = 
     log = r.run(t_end, standard_script(arm_t=T_ARM, policy_t=T_POLICY))
     res = _hover_metrics(f"{name} hover, {'randomized x%d' % n if randomize else 'nominal'}", r, log,
                          t0=T_POLICY + 1.0, t1=t_end, mode=POLICY)
+    return res
+
+
+# =========================================================================== disturbances (policy recovery)
+T_DIST = 9.0          # disturbance onset (policy engaged at T_POLICY, 3 s of hover before)
+T_DIST_END = 15.0
+TILT_DIST_DEG = 59.8          # hand tilt (TILT monitor: > 60.16 deg = 1.05 rad)
+TILT_DIST_RATE = 2.9          # rad/s, below the 4 rad/s TILT_PREDICTED gate
+THROW_DV_MAX = 3.0            # m/s
+THROW_DW_MAX = 5.0            # rad/s (tilt + 0.1 s * rate stays < 60 deg: the push alone cannot trip)
+THROW_PUSH_S = 0.02
+
+
+@dataclass
+class DisturbanceResult:
+    name: str
+    in_policy: np.ndarray       # never left POLICY from engage to the end
+    fault_history: np.ndarray
+    crashed: np.ndarray
+    recovered: np.ndarray       # |p - target| < 0.15 m and tilt < 10 deg for the last 2 s
+    max_tilt_deg: np.ndarray    # after the disturbance
+    alt_lost_m: np.ndarray
+    recover_s: np.ndarray       # first time after the release from which |p - target| < 0.2 m and tilt < 15 deg
+    peak_err_m: np.ndarray
+    rms_after_m: np.ndarray     # 3D RMS error over the last 3 s
+
+    @property
+    def passed(self) -> np.ndarray:
+        return self.in_policy & (self.fault_history == 0) & ~self.crashed & self.recovered
+
+
+def _unit(rng, n, horizontal=False):
+    v = rng.standard_normal((n, 3))
+    if horizontal:
+        v[:, 2] = 0.0
+    return v / np.linalg.norm(v, axis=-1, keepdims=True)
+
+
+def tilt_hook(t0: float, axis_w: np.ndarray, angle: float, rate: float):
+    """External 'hand': from t0 the vehicle is held in place and rotated about
+    the horizontal world axis `axis_w` (n,3) at `rate` until `angle`, then
+    released at rest. Gyro and accelerometer see the motion (omega and the
+    specific force of a held vehicle, R^T g e_z); the firmware keeps running."""
+    import torch
+    from sim.rotations import quat_from_axis_angle, quat_mul, quat_to_rotmat
+    dur = angle / rate
+    st = {}
+
+    def hook(r: SitlRunner, t: float):
+        if t <= t0 or t > t0 + dur + 1.5 * r.dt:
+            return
+        q = r.quad
+        if "q0" not in st:
+            st["q0"] = q.quat.clone()
+            st["p0"] = q.pos.clone()
+        ax = torch.as_tensor(axis_w, dtype=torch.float32)
+        held = t < t0 + dur
+        ang = torch.full((r.n,), min(rate * (t - t0), angle))
+        quat = quat_mul(quat_from_axis_angle(ax, ang), st["q0"])
+        q.quat = quat / quat.norm(dim=-1, keepdim=True)
+        q.R = quat_to_rotmat(q.quat)
+        w_w = ax * (rate if held else 0.0)
+        q.omega = torch.einsum("nji,nj->ni", q.R, w_w)
+        q.pos = st["p0"].clone()
+        q.vel = torch.zeros_like(q.vel)
+        q.specific_force_b = q.R[:, 2, :] * r.g
+    return hook
+
+
+def push_hook(t0: float, dv_w: np.ndarray, dw_b: np.ndarray, dur: float = THROW_PUSH_S):
+    """External push: velocity change dv_w (world) and body-rate change dw_b
+    spread over `dur` (the accelerometer sees the push force)."""
+    import torch
+    dv = torch.as_tensor(dv_w, dtype=torch.float32)
+    dw = torch.as_tensor(dw_b, dtype=torch.float32)
+
+    def hook(r: SitlRunner, t: float):
+        if t <= t0 or t > t0 + dur + 1e-9:
+            return
+        q = r.quad
+        frac = r.dt / dur
+        q.vel = q.vel + dv * frac
+        q.omega = q.omega + dw * frac
+        q.specific_force_b = q.specific_force_b + torch.einsum("nji,nj->ni", q.R, dv / dur)
+    return hook
+
+
+def policy_disturbance(policy: dict, kind: str, n: int = 20, seed: int = 0, int8: bool = False,
+                       power_on_s: float = POWER_ON_S, throw_dw_max: float = THROW_DW_MAX,
+                       keep_log: bool = False, engage_policy: bool = True):
+    """Policy recovery in SITL: fallback takeoff, POLICY from T_POLICY, then at
+    T_DIST either `tilt` (hand-tilted to 59.8 deg at 2.9 rad/s, released at
+    rest) or `throw` (20 ms push: |dv| U[0,3] m/s, |dw| U[0,throw_dw_max]
+    rad/s, random directions) on randomized vehicles. Pass = never leaves
+    POLICY, no supervisor fault, no crash, back within 0.15 m / 10 deg.
+    engage_policy=False flies the same disturbances with the firmware fallback
+    (FALLBACK_HOLD throughout) as a reference."""
+    r = SitlRunner(n, randomize=True, seed=seed, policy=policy, log_decimate=2, int8=int8)
+    assert r.policy_ok
+    rng = np.random.default_rng(seed + 777)
+    if kind == "tilt":
+        r.physics_hooks.append(tilt_hook(T_DIST, _unit(rng, n, horizontal=True), math.radians(TILT_DIST_DEG),
+                                         TILT_DIST_RATE))
+        t_rel = T_DIST + math.radians(TILT_DIST_DEG) / TILT_DIST_RATE
+    elif kind == "throw":
+        dv = _unit(rng, n) * rng.uniform(0, THROW_DV_MAX, (n, 1))
+        dw = _unit(rng, n) * rng.uniform(0, throw_dw_max, (n, 1))
+        r.physics_hooks.append(push_hook(T_DIST, dv, dw))
+        t_rel = T_DIST + THROW_PUSH_S
+    else:
+        raise ValueError(kind)
+    r.power_on(power_on_s)
+    log = r.run(T_DIST_END, standard_script(arm_t=T_ARM, policy_t=T_POLICY if engage_policy else None))
+    t = log.t
+    mode = log["mode"]
+    k_eng = t >= T_POLICY + 0.1
+    in_pol = (mode[k_eng] == (POLICY if engage_policy else FALLBACK_HOLD)).all(0)
+    after = t >= T_DIST
+    pos = log["pos"]
+    err = np.linalg.norm(pos - TARGET, axis=-1)
+    tilt = np.degrees(tilt_of_quat(log["quat"]))
+    z = pos[..., 2]
+    k0 = int(np.searchsorted(t, T_DIST))
+    alt_lost = np.maximum(0.0, z[k0] - z[after].min(0))
+    last = t >= T_DIST_END - 2.0
+    recovered = (err[last] < 0.15).all(0) & (tilt[last] < 10.0).all(0)
+    rel = t >= t_rel
+    bad = (err > 0.2) | (tilt > 15.0)
+    rec_s = np.full(n, np.nan)
+    for e in range(n):
+        b = np.nonzero(bad[rel, e])[0]
+        rec_s[e] = 0.0 if b.size == 0 else (t[rel][b[-1]] - t_rel + (t[1] - t[0]))
+    l3 = t >= T_DIST_END - 3.0
+    res = DisturbanceResult(f"{kind}", in_pol, log["fault_history"][-1].astype(np.int64), r.crashed.copy(),
+                            recovered, tilt[after].max(0), alt_lost, rec_s, err[after].max(0),
+                            np.sqrt((err[l3] ** 2).mean(0)))
+    if keep_log:
+        res.log = log
     return res
 
 
@@ -296,8 +435,8 @@ def bad_policy_flight(seeds=(0, 1, 2), randomize=False):
     return out
 
 
-def trained_policy() -> dict | None:
-    return load_nfpol(TRAINED_POLICY) if os.path.exists(TRAINED_POLICY) else None
+def trained_policy(path: str = TRAINED_POLICY) -> dict | None:
+    return load_nfpol(path) if os.path.exists(path) else None
 
 
 # =========================================================================== CTBR parity (INTERFACES.md section 9)
@@ -377,7 +516,10 @@ def ctbr_parity_closed_loop(seconds: float = 4.0, n: int = 16, seed: int = 0):
     """Realistic input distribution: sim QuadEnv-style closed loop (randomized
     vehicles, tilted/rotating initial states) flown by the sim RateController
     and the sim cascaded PID baseline; the firmware CTBR replays the exact same
-    (action, gyro) stream. Open-loop replay == closed loop (identical inputs)."""
+    (action, rate measurement) stream. The measurement is the env's own
+    (sim/fw_estimator.py: fw-filtered, bias-corrected gyro), and the env's
+    reset already seeds the rate PID with it (FOLLOWUPS 1). Open-loop replay
+    == closed loop (identical inputs)."""
     import torch
     from sim.ctbr import RateController, action_to_ctbr
     from sim.env import EnvConfig, QuadEnv
@@ -386,9 +528,6 @@ def ctbr_parity_closed_loop(seconds: float = 4.0, n: int = 16, seed: int = 0):
     env = QuadEnv(EnvConfig(num_envs=n, seed=seed, randomize_initial_time=False, episode_len_s=100.0))
     obs = env.reset()
     pid = CascadedPID(n, env.nom)
-    # Re-seed the rate controller exactly like the firmware does on its first
-    # update (prev measurement = first gyro sample).
-    env.rate_ctrl.reset(torch.arange(n), env.last_gyro.clone())
     fw = FirmwareCtbr(n)
     q = env.quad
     dmax, dsum, cnt = 0.0, 0.0, 0
@@ -399,7 +538,7 @@ def ctbr_parity_closed_loop(seconds: float = 4.0, n: int = 16, seed: int = 0):
         gyro = env.last_gyro
         for k in range(env.substeps):
             if k > 0:
-                gyro = q.sample_gyro()
+                gyro = env._sense()
             c_s = env.rate_ctrl(F, rsp, gyro)
             c_f, _ = fw.step(a.numpy(), gyro.numpy())
             dd = np.abs(c_s.numpy() - c_f)
@@ -407,21 +546,27 @@ def ctbr_parity_closed_loop(seconds: float = 4.0, n: int = 16, seed: int = 0):
             dsum += float(dd.sum())
             cnt += dd.size
             q.step(c_s)
-        env.last_gyro = q.sample_gyro()
+        env.last_gyro = env._sense()
         env.prev_action = a
         env._compute_obs()
         obs = env.obs_buf.clone()
     return {"max_abs": dmax, "mean_abs": dsum / cnt, "n": n, "steps": steps * env.substeps}
 
 
-def ctbr_full_loop_gap(policy: dict | None = None):
-    """Informational: the firmware ControlLoop feeds the rate PID with
-    filtered gyro (150 Hz biquad + RPM notches) minus the Mahony bias estimate,
-    whereas sim/ctbr.py (and training) use the raw gyro. Replays the actions
-    and raw IMU-A gyro of a SITL policy flight (randomized vehicle) through
-    sim/ctbr.py and compares with the firmware motor commands."""
+def ctbr_full_loop_gap(policy: dict | None = None, sim_filter: bool = True):
+    """Full firmware loop vs the sim inner loop on a SITL policy flight
+    (randomized vehicle): the logged raw IMU-A gyro and motor states are
+    replayed through the sim's measurement path and sim/ctbr.py, and the
+    commands compared with the firmware's.
+
+    sim_filter=True (training since hover_ctbr_v2): sim/fw_estimator.py
+    GyroFilterChain (150 Hz biquad + RPM notches) minus the bias estimate.
+    The firmware's Mahony bias is not logged, so the replay uses the median
+    of (sim-filtered - firmware state.omega) over the flight; its drift is in
+    `bias_drift`. sim_filter=False: the raw gyro (v1 training; FOLLOWUPS 2)."""
     import torch
     from sim.ctbr import action_to_ctbr
+    from sim.fw_estimator import GyroFilterChain
     from sim.params import load_nominal
     nom = load_nominal()
     pol = policy or linear_hover_policy()
@@ -430,17 +575,66 @@ def ctbr_full_loop_gap(policy: dict | None = None):
     log = r.run(T_POLICY + 4.0, standard_script(arm_t=T_ARM, policy_t=T_POLICY))
     mode = log["mode"][:, 0]
     ke = int(np.nonzero(mode == POLICY)[0][0])
+    gyro = log["gyro"][:, 0]
+    if sim_filter:
+        gf = GyroFilterChain(1)
+        filt = np.stack([gf.step(torch.from_numpy(gyro[k][None].copy()), torch.from_numpy(400.0 * log["motor"][k, 0][None].copy())).numpy()[0]
+                         for k in range(len(log.t))])
+        diff = filt - log["est_omega"][:, 0]
+        win = slice(ke, len(log.t))
+        bias = np.median(diff[win], axis=0)
+        meas = (filt - bias).astype(np.float32)
+        drift = float(np.abs(diff[win] - bias).max())
+    else:
+        meas, drift = gyro, float("nan")
+    # Replay the whole armed flight (fallback takeoff + policy) so the sim PID
+    # carries the same integrator into POLICY: (thrust, rate setpoint) are the
+    # firmware's logged CTBR commands; the firmware resets the PID while the
+    # collective is below 0.3 * weight (on the ground).
     rc, _ = _sim_ctbr(1, nom)
-    rc.reset(torch.arange(1), torch.from_numpy(log["gyro"][ke, 0][None].copy()))
-    d = []
-    for k in range(ke, len(log.t)):
-        if mode[k] != POLICY:
-            break
-        a = torch.from_numpy(log["action"][k, 0][None].copy())
-        F, rsp = action_to_ctbr(a, nom)
-        c_s = rc(F, rsp, torch.from_numpy(log["gyro"][k, 0][None].copy())).numpy()[0]
-        d.append(np.abs(c_s - log["cmd"][k, 0]))
+    w_min = 0.3 * nom["mass"] * nom["gravity"]
+    armed = log["armed"][:, 0] == 1
+    d, fresh = [], True
+    for k in range(len(log.t)):
+        F = float(log["thrust_sp"][k, 0, 0])
+        if not armed[k] or F < w_min:
+            fresh = True
+            continue
+        if fresh:
+            rc.reset(torch.arange(1), torch.from_numpy(meas[k][None].copy()))
+            fresh = False
+        c_s = rc(torch.tensor([F]), torch.from_numpy(log["rate_sp"][k, 0][None].copy()),
+                 torch.from_numpy(meas[k][None].copy())).numpy()[0]
+        if mode[k] == POLICY:
+            d.append(np.abs(c_s - log["cmd"][k, 0]))
     d = np.asarray(d)
-    skip = 200   # ignore the integrator handover transient (fw PID kept its fallback state)
-    return {"max_abs": float(d[skip:].max()), "rms": float(np.sqrt((d[skip:] ** 2).mean())),
-            "gyro_noise_std": float(r.quad.params.gyro_noise_std[0]), "steps": int(len(d) - skip)}
+    return {"max_abs": float(d.max()), "rms": float(np.sqrt((d ** 2).mean())),
+            "gyro_noise_std": float(r.quad.params.gyro_noise_std[0]), "steps": int(len(d)),
+            "bias_drift": drift}
+
+
+def gyro_filter_parity(n: int = 32, steps: int = 5000, seed: int = 0):
+    """sim/fw_estimator.GyroFilterChain vs the firmware chain (nf_gfilt_*):
+    identical raw gyro + motor-frequency streams (motor states random-walk
+    through the 80 Hz notch activation threshold)."""
+    import torch
+    from sim.fw_estimator import GyroFilterChain
+    from sitl import FirmwareGyroFilter
+    rng = np.random.default_rng(seed)
+    fw, sf = FirmwareGyroFilter(n), GyroFilterChain(n)
+    g = np.zeros((n, 3), np.float32)
+    w = rng.uniform(0, 1, (n, 4)).astype(np.float32)
+    dmax, toggles, prev = 0.0, 0, None
+    for _ in range(steps):
+        g = (0.995 * g + rng.normal(0, 0.15, (n, 3))).astype(np.float32)
+        gn = (g + rng.normal(0, 0.05, (n, 3))).astype(np.float32)
+        w = np.clip(w + rng.normal(0, 0.02, (n, 4)), 0, 1).astype(np.float32)
+        hz = (400.0 * w).astype(np.float32)
+        a = fw.step(gn, hz)
+        b = sf.step(torch.from_numpy(gn), torch.from_numpy(hz)).numpy()
+        dmax = max(dmax, float(np.abs(a - b).max()))
+        act = hz >= 80.0
+        if prev is not None:
+            toggles += int((act != prev).sum())
+        prev = act
+    return {"max_abs": dmax, "notch_toggles": toggles, "n": n, "steps": steps}

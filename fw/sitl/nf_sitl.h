@@ -15,7 +15,7 @@
 extern "C" {
 #endif
 
-#define NF_SITL_ABI_VERSION 1
+#define NF_SITL_ABI_VERSION 2
 
 /* ---- per-env float inputs (NF_IN_F floats) */
 enum {
@@ -56,7 +56,9 @@ enum {
   NF_OUT_THRUST = 17,   /* CTBR collective (N) fed to the rate loop */
   NF_OUT_RATE_SP = 18,  /* [3] body-rate setpoint */
   NF_OUT_ACTION = 21,   /* [4] last policy output */
-  NF_OUT_F = 25
+  NF_OUT_ACC_INNOV = 25, /* Mahony low-passed accel innovation (rad), supervisor ESTIMATOR input */
+  NF_OUT_KF_NIS = 26,    /* KF low-passed NIS, supervisor ESTIMATOR input */
+  NF_OUT_F = 27
 };
 /* ---- per-env uint32 outputs (NF_OUT_U) */
 enum {
@@ -109,6 +111,23 @@ void nf_sitl_set_inference_us(void* h, int32_t env, uint32_t us);
  * out_f[n*NF_OUT_F], out_u[n*NF_OUT_U]. */
 void nf_sitl_step(void* h, uint64_t now_us, const float* in_f, const int32_t* in_i, float* out_f, uint32_t* out_u);
 
+/* Diagnostics (sim-to-real gap analysis): per-env nf::InputOverride.
+ * mask[n] (InputOverride bits; 0 = off), vals[n*NF_OVR_F]:
+ * q w,x,y,z | omega_policy[3] | omega_pid[3] | pos[3] | vel[3]. Values are
+ * copied; call before nf_sitl_step on every step they should apply to. */
+#define NF_OVR_F 16
+void nf_sitl_set_overrides(void* h, const uint32_t* mask, const float* vals);
+
+/* Load an int8 model given as an nfpol int8 block (INTERFACES.md section 7)
+ * into env (env < 0: all). Arrays per layer l (dims[l] -> dims[l+1]), all
+ * layers concatenated: W_q int8 [out][in], b_q int32 [out], s_w float [out];
+ * hidden layers also M int32 [out], S int32 [out], lut int8 [256], s_pre.
+ * last_s_x: s_x of the last layer. Returns 1 if policy_ok(). */
+int32_t nf_sitl_set_policy_i8(void* h, int32_t env, int32_t n_layers, const int32_t* dims, const float* mean,
+                              const float* std, float s_in, const int8_t* Wq, const int32_t* bq,
+                              const float* s_w, const int32_t* M, const int32_t* S, const int8_t* lut,
+                              const float* s_x, const float* s_pre, uint32_t* crc_out);
+
 const char* nf_sitl_mode_name(int32_t mode);
 const char* nf_sitl_fault_name(uint32_t single_bit);
 
@@ -122,6 +141,13 @@ void nf_ctbr_reset(void* h);
 /* action[n*4] (CTBR, [-1,1]), gyro[n*3] -> cmd[n*4], saturated[n] (0/1),
  * torque[n*3] (optional, may be NULL). */
 void nf_ctbr_step(void* h, const float* action, const float* gyro, float* cmd, int32_t* saturated, float* torque);
+
+/* ---- Gyro filter chain in isolation (ControlLoop step 1: default 150 Hz
+ * biquad LPF -> RPM notch bank), for parity with sim/fw_estimator.py.
+ * gyro[n*3] raw, motor_hz[n*4] -> out[n*3] (before bias subtraction). */
+void* nf_gfilt_create(int32_t n, int32_t rate_hz);
+void nf_gfilt_destroy(void* h);
+void nf_gfilt_step(void* h, const float* gyro, const float* motor_hz, float* out);
 
 #ifdef __cplusplus
 }

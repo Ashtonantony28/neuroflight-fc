@@ -77,10 +77,13 @@ The policy is trained against `sim/ctbr.py`; firmware must reproduce it exactly 
 - Mixer (thrusts → commands by inverting the thrust curve): roll/pitch differential thrusts are scaled down uniformly to fit `[T_idle, thrust_max]`; collective is then shifted to make room; yaw is added last with the largest scale s∈[0,1] that stays within limits.
 - Collective thrust and rate scaling use **nominal** `thrust_max` / `max_body_rate`.
 - Gains/filter live in `sim/ctbr.py::RatePIDGains`; the source of truth will move to `config/rate_pid.yaml` when the SITL workstream wires firmware ↔ sim.
+- **Rate measurement (since hover_ctbr_v2, FOLLOWUPS 2):** the rate PID input AND policy obs 12-14 are the firmware's `state.omega`: raw IMU-A gyro → 150 Hz biquad low-pass (RBJ, Q = 1/√2, DF2T) → RPM notch bank (one notch per motor per axis at the motor rotation frequency, Q = 3, bypassed below 80 Hz, state reset on (re)activation, centre clamped to 0.45·fs; updated before filtering) → minus the gyro-bias estimate. The sim implements the chain in `sim/fw_estimator.py::GyroFilterChain` (float32, same op order; SITL parity test `test_gyro_filter_chain_matches_firmware`, ≤ 1e-5 rad/s) and models the bias estimate as true bias + N(0, `gyro_bias_resid_std` = 1e-3 rad/s) per episode (SITL after at-rest calibration: ~3e-4). `EnvConfig(gyro_filter=False)` restores the raw-gyro path (v1).
+- **Reset (FOLLOWUPS 1):** on reset the sim seeds the D-term's previous measurement with the first measurement (as `nf::RatePid` does on its first update) and starts the gyro filters in steady state at the current rate (the firmware filters never restart in flight). `RateController.reset(idx)` without a measurement keeps the old prev = 0 behaviour for unit tests only.
 
 ## 10. Reset conventions
 - "Previous action" (obs 15-18) is **zeros** at reset / on policy engage.
-- Observation attitude is currently ground truth in sim (no estimator error modelled yet); gyro has noise + bias.
+- Observation attitude is ground truth in sim (optionally times a fixed per-episode misalignment, `att_misalign_deg`; SITL Mahony error is ~0.1° rms in hover). Body rates: see §9 (filtered, bias-corrected).
+- Position / velocity (`EnvConfig.estimator`): `False` = truth + white noise per step (v1 training); `True` (hover_ctbr_v2 training) = the firmware's flow/ToF Kalman filter, `sim/fw_estimator.py::TranslationKf` (port of `nf::TranslationKf` with its default config and gates, fed with the 40 Hz-filtered accelerometer and SITL-identical 100 Hz range/flow measurements, flow de-rotated with the filtered rates). It is reset to the true state on episode reset.
 
 ## 11. int8 clarifications (from WS2, binding)
 - Rounding in §7 step 1 is **half away from zero, matching C++ `std::round`** on the float32 value. numpy's `np.round` is half-to-even, and `floor(|x|+0.5)` in float32 is wrong for |x| = 0.49999997, so the golden model adds 0.5 in float64 (tools/golden.py is the reference).

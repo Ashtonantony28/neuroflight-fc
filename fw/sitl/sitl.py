@@ -55,15 +55,19 @@ from sim.quadrotor import Quadrotor  # noqa: E402
 
 BUILD_DIR = os.path.join(HERE, "build")
 LIB_PATH = os.path.join(BUILD_DIR, "libnf_sitl.so")
-ABI_VERSION = 1
+ABI_VERSION = 2
 
 # ---- layouts (mirror fw/sitl/nf_sitl.h)
 IN_GYRO, IN_ACCEL, IN_GYRO_B, IN_ACCEL_B = 0, 3, 6, 9
 IN_FLOW_X, IN_FLOW_Y, IN_FLOW_Q, IN_RANGE, IN_MOTOR_HZ, IN_VBAT, IN_THROTTLE, IN_F = 12, 13, 14, 15, 16, 20, 21, 22
 (II_B_VALID, II_FLOW_VALID, II_RANGE_VALID, II_RPM_VALID, II_VBAT_VALID, II_LINK_OK, II_ARM, II_KILL,
  II_POLICY_ENABLE, II_REENGAGE, IN_I) = range(11)
-OUT_CMD, OUT_Q, OUT_OMEGA, OUT_POS, OUT_VEL, OUT_THRUST, OUT_RATE_SP, OUT_ACTION, OUT_F = 0, 4, 8, 11, 14, 17, 18, 21, 25
+OUT_CMD, OUT_Q, OUT_OMEGA, OUT_POS, OUT_VEL, OUT_THRUST, OUT_RATE_SP, OUT_ACTION = 0, 4, 8, 11, 14, 17, 18, 21
+OUT_ACC_INNOV, OUT_KF_NIS, OUT_F = 25, 26, 27
 (OU_ARMED, OU_MODE, OU_ACTIVE, OU_HISTORY, OU_FIRST, OU_ARM_FAIL, OU_INFER_US, OU_FLAGS, OUT_U) = range(9)
+
+# nf::InputOverride bits (diagnostics)
+OVR_POLICY_Q, OVR_POLICY_OMEGA, OVR_POLICY_POS, OVR_POLICY_VEL, OVR_PID_OMEGA = 1, 2, 4, 8, 16
 
 # nf::FlightMode
 DISARMED, POLICY, FALLBACK_HOLD, CONTROLLED_DESCENT, MOTOR_STOP = range(5)
@@ -133,6 +137,13 @@ def lib():
         L.nf_sitl_mode_name.restype = ctypes.c_char_p
         L.nf_sitl_fault_name.argtypes = [u32]
         L.nf_sitl_fault_name.restype = ctypes.c_char_p
+        L.nf_sitl_set_overrides.argtypes = [vp, vp, vp]
+        L.nf_sitl_set_policy_i8.argtypes = [vp, i32, i32, vp, vp, vp, f32, vp, vp, vp, vp, vp, vp, vp, vp, P(u32)]
+        L.nf_sitl_set_policy_i8.restype = i32
+        L.nf_gfilt_create.argtypes = [i32, i32]
+        L.nf_gfilt_create.restype = vp
+        L.nf_gfilt_destroy.argtypes = [vp]
+        L.nf_gfilt_step.argtypes = [vp, vp, vp, vp]
         L.nf_ctbr_create.argtypes = [i32, i32]
         L.nf_ctbr_create.restype = vp
         L.nf_ctbr_destroy.argtypes = [vp]
@@ -296,6 +307,38 @@ class Firmware:
                                            _ptr(b), _ptr(acts), ctypes.byref(crc))
         return bool(ok), crc.value
 
+    def set_policy_int8(self, pol: dict, env: int = -1) -> tuple[bool, int]:
+        """Load the `int8` block of a quantized nfpol (tools/quantize.py) as an
+        nf::Int8Model (the firmware's int8 inference path)."""
+        q = pol["int8"]
+        Ls = q["layers"]
+        dims = [len(Ls[0]["W_q"][0])] + [len(L["W_q"]) for L in Ls]
+        cat = lambda key, dt, ls: np.ascontiguousarray(np.concatenate([np.asarray(L[key], dt).reshape(-1) for L in ls]))
+        hid = Ls[:-1]
+        Wq, bq, sw = cat("W_q", np.int8, Ls), cat("b_q", np.int32, Ls), cat("s_w", np.float32, Ls)
+        M = cat("M", np.int32, hid) if hid else np.zeros(1, np.int32)
+        S = cat("S", np.int32, hid) if hid else np.zeros(1, np.int32)
+        lut = cat("lut", np.int8, hid) if hid else np.zeros(1, np.int8)
+        s_x = np.asarray([L["s_x"] for L in Ls], np.float32)
+        s_x[-1] = np.float32(q["s_x_last"])
+        s_pre = np.asarray([L.get("s_pre", 0.0) for L in Ls], np.float32)
+        mean = np.ascontiguousarray(pol["obs_mean"], np.float32)
+        std = np.ascontiguousarray(pol["obs_std"], np.float32)
+        d = np.asarray(dims, np.int32)
+        self._keep = [d, mean, std, Wq, bq, sw, M, S, lut, s_x, s_pre]
+        crc = ctypes.c_uint32(0)
+        ok = self.L.nf_sitl_set_policy_i8(self.h, env, len(Ls), _ptr(d), _ptr(mean), _ptr(std), float(q["s_in"]),
+                                          _ptr(Wq), _ptr(bq), _ptr(sw), _ptr(M), _ptr(S), _ptr(lut), _ptr(s_x),
+                                          _ptr(s_pre), ctypes.byref(crc))
+        return bool(ok), crc.value
+
+    def set_overrides(self, mask: np.ndarray, vals: np.ndarray):
+        """Diagnostics: per-env nf::InputOverride (OVR_* bits), vals (n, 16):
+        q[4] | omega_policy[3] | omega_pid[3] | pos[3] | vel[3]."""
+        self._ovr_m = np.ascontiguousarray(mask, np.uint32)
+        self._ovr_v = np.ascontiguousarray(vals, np.float32)
+        self.L.nf_sitl_set_overrides(self.h, _ptr(self._ovr_m), _ptr(self._ovr_v))
+
     def clear_policy(self, env: int = -1):
         self.L.nf_sitl_clear_policy(self.h, env)
 
@@ -347,6 +390,28 @@ class FirmwareCtbr:
         return self.cmd.copy(), self.sat.astype(bool)
 
 
+class FirmwareGyroFilter:
+    """Firmware gyro LPF + RPM notch bank, batched (parity with sim/fw_estimator.py)."""
+
+    def __init__(self, n: int, rate_hz: int = 1000):
+        self.L = lib()
+        self.n = n
+        self.h = self.L.nf_gfilt_create(n, rate_hz)
+        self.out = np.zeros((n, 3), np.float32)
+
+    def __del__(self):
+        try:
+            self.L.nf_gfilt_destroy(self.h)
+        except Exception:
+            pass
+
+    def step(self, gyro: np.ndarray, motor_hz: np.ndarray) -> np.ndarray:
+        g = np.ascontiguousarray(gyro, np.float32)
+        m = np.ascontiguousarray(motor_hz, np.float32)
+        self.L.nf_gfilt_step(self.h, _ptr(g), _ptr(m), _ptr(self.out))
+        return self.out.copy()
+
+
 # =========================================================================== RC script
 @dataclass
 class RcScript:
@@ -390,7 +455,7 @@ def standard_script(arm_t=1.5, policy_t: float | None = None, kill_t: float | No
 LOG_FIELDS = {  # name -> per-env width
     "pos": 3, "vel": 3, "quat": 4, "omega": 3, "motor": 4, "cmd": 4,
     "est_pos": 3, "est_vel": 3, "est_quat": 4, "est_omega": 3,
-    "thrust_sp": 1, "rate_sp": 3, "action": 4, "gyro": 3,
+    "thrust_sp": 1, "rate_sp": 3, "action": 4, "gyro": 3, "acc_innov": 1, "kf_nis": 1,
 }
 LOG_UFIELDS = ["armed", "mode", "active_faults", "fault_history", "first_fault", "arm_fail", "inference_us"]
 
@@ -417,6 +482,8 @@ class Log:
         F["thrust_sp"][k, :, 0] = out_f[:, OUT_THRUST]
         F["rate_sp"][k] = out_f[:, OUT_RATE_SP:OUT_RATE_SP + 3]
         F["action"][k] = out_f[:, OUT_ACTION:OUT_ACTION + 4]
+        F["acc_innov"][k, :, 0] = out_f[:, OUT_ACC_INNOV]
+        F["kf_nis"][k, :, 0] = out_f[:, OUT_KF_NIS]
         if in_f is not None:
             F["gyro"][k] = in_f[:, IN_GYRO:IN_GYRO + 3]   # IMU A as fed to the firmware
         for j, name in enumerate(LOG_UFIELDS):
@@ -465,7 +532,7 @@ class SitlRunner:
     def __init__(self, n_envs: int = 1, randomize: bool = False, seed: int = 0, flow_hz: int = 100,
                  imu_b: bool = True, start_pos=(0.0, 0.0, 0.0), nominal: dict | None = None,
                  randomization: dict | None = None, policy: dict | None = None, log_decimate: int = 1,
-                 **fw_kwargs):
+                 int8: bool = False, **fw_kwargs):
         self.nom = nominal or load_nominal()
         self.rand = randomization or load_randomization()
         self.n = n_envs
@@ -475,8 +542,12 @@ class SitlRunner:
         self.fw = Firmware(n_envs, rate_hz=self.rate_hz, control_hz=int(self.nom["control_rate_hz"]), **fw_kwargs)
         self.policy = policy
         self.policy_ok = None
+        self.int8 = int8
         if policy is not None:
-            self.policy_ok, self.policy_crc = self.fw.set_policy(policy)
+            if int8:
+                self.policy_ok, self.policy_crc = self.fw.set_policy_int8(policy)
+            else:
+                self.policy_ok, self.policy_crc = self.fw.set_policy(policy)
         self.rng = np.random.default_rng(seed + 12345)
         self.flow_div = max(1, int(round(self.rate_hz / flow_hz)))
         self.imu_b = imu_b
@@ -493,6 +564,7 @@ class SitlRunner:
         self.step_k = 0
         self.t = 0.0
         self.hooks: list[Callable] = []       # hook(runner, t) before each firmware step (fault injection)
+        self.physics_hooks: list[Callable] = []  # hook(runner, t) after each physics step (external disturbances)
         self.crashed = np.zeros(n_envs, bool)
         self.crash_reason = [""] * n_envs
         self.touchdowns: list[list[tuple]] = [[] for _ in range(n_envs)]  # (t, vz, tilt)
@@ -641,6 +713,8 @@ class SitlRunner:
             if self.step_k % self.log_decimate == 0:
                 log.record(self.t, self.quad, self.cmd, out_f, out_u, self.fw.in_f)
             self._physics(self.cmd)   # sim applies its latency buffer + motor lag
+            for h in self.physics_hooks:
+                h(self, self.t + self.dt)
             self.step_k += 1
             self.t = self.step_k * self.dt
             if stop is not None and stop(self):
