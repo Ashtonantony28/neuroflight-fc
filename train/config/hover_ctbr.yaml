@@ -1,0 +1,72 @@
+# PPO for CTBR hover / recovery (stage A). Read by train/ppo.py.
+run_name: hover_ctbr
+seed: 0
+threads: 4
+randomization: config/randomization.yaml   # domain randomization ON (use_nominal: false)
+reward_scale: 0.02                         # applied to env reward before GAE
+log_every: 10
+checkpoint_every: 50
+
+env:
+  num_envs: 2048
+  use_nominal: false
+  episode_len_s: 3.0          # shorter than eval (5 s) => more resets; timeouts are bootstrapped
+  randomize_initial_time: true
+  target_xy: 1.0
+  target_z: [1.2, 2.2]
+  init_min_z: 0.6
+  oob_dist: 3.0
+  max_rate_term: 40.0
+
+reward_weights:               # see sim/env.py DEFAULT_REWARD_WEIGHTS for the terms
+  alive: 5.0                  # large enough that surviving is always better than crashing early
+  pos: 1.0
+  vel: 0.3
+  upright: 1.0
+  rate: 0.02
+  yaw_rate: 0.02
+  action: 0.02
+  smooth: 0.5
+  crash: 100.0
+
+# linear schedules (by iteration) for reward weights, applied on top of reward_weights
+reward_ramp:
+  smooth: {start: 0.1, end: 0.5, iters: 300}
+
+model:
+  actor_hidden: [64, 64]
+  critic_hidden: [128, 128]
+  hover_bias_init: true       # thrust output bias -> nominal hover collective
+
+ppo:
+  iterations: 1500
+  rollout_steps: 64
+  epochs: 4
+  minibatches: 4
+  gamma: 0.997                # 500 Hz control: ~0.7 s horizon
+  lam: 0.99                   # GAE horizon ~100 steps (0.2 s); 0.97 was too myopic at 500 Hz
+  clip: 0.2
+  lr: 3.0e-4
+  kl_target: 0.01
+  lr_min: 1.0e-5
+  lr_max: 1.0e-3
+  vf_coef: 1.0
+  value_clip: false           # returns are O(50): PPO value clipping (0.2) stalls the critic
+  ent_coef: 0.0
+  max_grad_norm: 1.0
+  init_log_std: -1.0
+  min_log_std: -3.0
+
+# Initial-state curriculum (EnvConfig fields). Advance when the EMA of the
+# fraction of episodes that end by timeout (not crash/OOB) >= advance_success.
+# Tilt is uniform in [0, max]; init vel/rate uniform per axis in [-v, v].
+curriculum:
+  ema: 0.9
+  advance_success: 0.9
+  min_iters: 40
+  levels:
+    - {init_max_tilt_deg: 15,  init_pos_offset: 0.3, init_max_vel: 0.3, init_max_rate: 0.5, init_upside_down_prob: 0.0}
+    - {init_max_tilt_deg: 45,  init_pos_offset: 0.7, init_max_vel: 1.0, init_max_rate: 2.0, init_upside_down_prob: 0.0}
+    - {init_max_tilt_deg: 75,  init_pos_offset: 1.0, init_max_vel: 1.5, init_max_rate: 4.0, init_upside_down_prob: 0.0}
+    - {init_max_tilt_deg: 100, init_pos_offset: 1.0, init_max_vel: 2.0, init_max_rate: 7.0, init_upside_down_prob: 0.1}
+    - {init_max_tilt_deg: 120, init_pos_offset: 1.0, init_max_vel: 2.5, init_max_rate: 10.0, init_upside_down_prob: 0.2}
