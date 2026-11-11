@@ -15,7 +15,7 @@
 extern "C" {
 #endif
 
-#define NF_SITL_ABI_VERSION 2
+#define NF_SITL_ABI_VERSION 3
 
 /* ---- per-env float inputs (NF_IN_F floats) */
 enum {
@@ -58,7 +58,8 @@ enum {
   NF_OUT_ACTION = 21,   /* [4] last policy output */
   NF_OUT_ACC_INNOV = 25, /* Mahony low-passed accel innovation (rad), supervisor ESTIMATOR input */
   NF_OUT_KF_NIS = 26,    /* KF low-passed NIS, supervisor ESTIMATOR input */
-  NF_OUT_F = 27
+  NF_OUT_ACC_REF = 27,   /* [3] low-passed KF acceleration (W), Mahony specific-force reference - g */
+  NF_OUT_F = 30
 };
 /* ---- per-env uint32 outputs (NF_OUT_U) */
 enum {
@@ -80,6 +81,8 @@ typedef struct nf_sitl_config {
   int32_t rpm_filter;     /* 0/1 */
   float gyro_lpf_hz;
   float accel_lpf_hz;
+  int32_t mahony_kf_ref;  /* <0 firmware default, 0 gravity reference, 1 KF-acceleration reference */
+  float mahony_ref_deadband; /* <0 firmware default, else m/s^2 */
 } nf_sitl_config;
 
 int nf_sitl_abi_version(void);
@@ -148,6 +151,17 @@ void nf_ctbr_step(void* h, const float* action, const float* gyro, float* cmd, i
 void* nf_gfilt_create(int32_t n, int32_t rate_hz);
 void nf_gfilt_destroy(void* h);
 void nf_gfilt_step(void* h, const float* gyro, const float* motor_hz, float* out);
+
+/* ---- Mahony attitude filter in isolation (default nf::Mahony::Config), for
+ * parity with sim/fw_estimator.py. q[n*4] (w,x,y,z), bias[n*3], t_s = filter age.
+ * step: gyro[n*3] (filtered, NOT bias-corrected), accel[n*3] (filtered),
+ * sf_ref[n*3] world-frame specific-force reference or NULL (gravity);
+ * outputs q_out[n*4], bias_out[n*3], innov_out[n] (any may be NULL). */
+void* nf_mahony_create(int32_t n);
+void nf_mahony_destroy(void* h);
+void nf_mahony_reset(void* h, const float* q, const float* bias, float t_s);
+void nf_mahony_step(void* h, const float* gyro, const float* accel, const float* sf_ref, float dt, float* q_out,
+                    float* bias_out, float* innov_out);
 
 #ifdef __cplusplus
 }

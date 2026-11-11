@@ -23,6 +23,7 @@ from sitl import (calibrated_nominal, CONTROLLED_DESCENT, FALLBACK_HOLD, FAULT, 
 
 TRAINED_POLICY = os.path.join(ROOT, "train", "policies", "hover_ctbr_v1.nfpol.json")
 TRAINED_POLICY_V2 = os.path.join(ROOT, "train", "policies", "hover_ctbr_v2.nfpol.json")
+TRAINED_POLICY_V3 = os.path.join(ROOT, "train", "policies", "hover_ctbr_v3.nfpol.json")
 # Long stationary power-on for the reference runs. Since the at-rest gyro
 # calibration (nf::GyroCalibrator) the firmware can also arm ~2 s after
 # power-on (see test_arm_2s_after_power_on_and_hover_20_randomized).
@@ -67,9 +68,9 @@ def _hover_metrics(name, r: SitlRunner, log, t0=HOVER_T0, t1=HOVER_T1, mode=FALL
 
 
 def fallback_hover(n: int = 1, randomize: bool = False, seed: int = 0, power_on_s: float = POWER_ON_S,
-                   keep_log: bool = False) -> HoverResult:
+                   keep_log: bool = False, fw_kwargs: dict | None = None) -> HoverResult:
     """(a) firmware fallback: take off from the ground, hover at 1 m for 10 s."""
-    r = SitlRunner(n, randomize=randomize, seed=seed, log_decimate=5)
+    r = SitlRunner(n, randomize=randomize, seed=seed, log_decimate=5, **(fw_kwargs or {}))
     r.power_on(power_on_s)
     log = r.run(HOVER_T1, standard_script(arm_t=T_ARM))
     name = f"fallback hover, {'randomized x%d' % n if randomize else 'nominal'}, power-on {power_on_s:g} s"
@@ -89,9 +90,10 @@ def _calibrate(r: SitlRunner):
 
 
 def policy_hover(policy: dict, n: int = 1, randomize: bool = False, seed: int = 0, name: str = "policy",
-                 power_on_s: float = POWER_ON_S, hold_s: float = 10.0, int8: bool = False) -> HoverResult:
+                 power_on_s: float = POWER_ON_S, hold_s: float = 10.0, int8: bool = False,
+                 fw_kwargs: dict | None = None) -> HoverResult:
     """(b) take off in FALLBACK_HOLD, switch to POLICY at T_POLICY, hover `hold_s`."""
-    r = SitlRunner(n, randomize=randomize, seed=seed, policy=policy, log_decimate=5, int8=int8)
+    r = SitlRunner(n, randomize=randomize, seed=seed, policy=policy, log_decimate=5, int8=int8, **(fw_kwargs or {}))
     assert r.policy_ok, "firmware rejected the policy"
     if randomize and (policy.get("meta") or {}).get("name") == "linear_hover":
         _calibrate(r)
@@ -189,7 +191,7 @@ def push_hook(t0: float, dv_w: np.ndarray, dw_b: np.ndarray, dur: float = THROW_
 
 def policy_disturbance(policy: dict, kind: str, n: int = 20, seed: int = 0, int8: bool = False,
                        power_on_s: float = POWER_ON_S, throw_dw_max: float = THROW_DW_MAX,
-                       keep_log: bool = False, engage_policy: bool = True):
+                       keep_log: bool = False, engage_policy: bool = True, fw_kwargs: dict | None = None):
     """Policy recovery in SITL: fallback takeoff, POLICY from T_POLICY, then at
     T_DIST either `tilt` (hand-tilted to 59.8 deg at 2.9 rad/s, released at
     rest) or `throw` (20 ms push: |dv| U[0,3] m/s, |dw| U[0,throw_dw_max]
@@ -197,7 +199,7 @@ def policy_disturbance(policy: dict, kind: str, n: int = 20, seed: int = 0, int8
     POLICY, no supervisor fault, no crash, back within 0.15 m / 10 deg.
     engage_policy=False flies the same disturbances with the firmware fallback
     (FALLBACK_HOLD throughout) as a reference."""
-    r = SitlRunner(n, randomize=True, seed=seed, policy=policy, log_decimate=2, int8=int8)
+    r = SitlRunner(n, randomize=True, seed=seed, policy=policy, log_decimate=2, int8=int8, **(fw_kwargs or {}))
     assert r.policy_ok
     rng = np.random.default_rng(seed + 777)
     if kind == "tilt":
@@ -638,3 +640,96 @@ def gyro_filter_parity(n: int = 32, steps: int = 5000, seed: int = 0):
             toggles += int((act != prev).sum())
         prev = act
     return {"max_abs": dmax, "notch_toggles": toggles, "n": n, "steps": steps}
+
+
+def mahony_parity(n: int = 32, steps: int = 20000, seed: int = 0, t0: float = 0.0):
+    """sim/fw_estimator.Mahony vs nf::Mahony (nf_mahony_*): identical filtered
+    gyro / accel streams from random attitudes and biases; on every other step
+    a random world-frame specific-force reference (the KF-acceleration path),
+    else the gravity reference. Rates random-walk across the 2 rad/s accel
+    gate. t0 = 0 includes the boosted-gain init phase."""
+    import torch
+    from sim.fw_estimator import Mahony
+    from sitl import FirmwareMahony
+    rng = np.random.default_rng(seed)
+    fw, sm = FirmwareMahony(n), Mahony(n)
+    q0 = rng.standard_normal((n, 4)).astype(np.float32)
+    q0 /= np.linalg.norm(q0, axis=1, keepdims=True)
+    b0 = rng.normal(0, 0.02, (n, 3)).astype(np.float32)
+    fw.reset(q0, b0, t0)
+    sm.reset(torch.arange(n), torch.from_numpy(q0), torch.from_numpy(b0), t0)
+    w = np.zeros((n, 3), np.float32)
+    dq = db = di = 0.0
+    gated = 0
+    for k in range(steps):
+        w = (0.998 * w + rng.normal(0, 0.08, (n, 3))).astype(np.float32)
+        acc = (np.array([0, 0, 9.81]) + rng.normal(0, 1.5, (n, 3))).astype(np.float32)
+        ref = (np.array([0, 0, 9.81]) + rng.normal(0, 2.0, (n, 3))).astype(np.float32) if k % 2 else None
+        qa, ba, ia = fw.step(w, acc, 0.001, ref)
+        sm.update(torch.from_numpy(w), torch.from_numpy(acc), 0.001, None if ref is None else torch.from_numpy(ref))
+        qb, bb, ib = sm.q.numpy(), sm.bias.numpy(), sm.innov.numpy()
+        sgn = np.sign((qa * qb).sum(1, keepdims=True))
+        dq = max(dq, float(np.abs(qa - sgn * qb).max()))
+        db = max(db, float(np.abs(ba - bb).max()))
+        di = max(di, float(np.abs(ia - ib).max()))
+        gated += int((np.linalg.norm(w - ba, axis=1) < 2.0).sum())
+    return {"q_max_abs": dq, "bias_max_abs": db, "innov_max_abs": di, "gated_frac": gated / (steps * n),
+            "n": n, "steps": steps}
+
+
+# =========================================================================== thrust noise / attitude error (v3)
+def _body_z(q: np.ndarray) -> np.ndarray:
+    w, x, y, z = (q[..., i] for i in range(4))
+    return np.stack((2 * (x * z + w * y), 2 * (y * z - w * x), w * w - x * x - y * y + z * z), -1)
+
+
+def tilt_error_deg(q_true: np.ndarray, q_est: np.ndarray) -> np.ndarray:
+    """Angle (deg) between the true and estimated body z axes (yaw-free attitude error)."""
+    return np.degrees(np.arccos(np.clip((_body_z(q_true) * _body_z(q_est)).sum(-1), -1.0, 1.0)))
+
+
+def hf_rms(x: np.ndarray, fs: float, cutoff_hz: float = 50.0) -> np.ndarray:
+    """RMS of the content above cutoff (rfft, mean removed, Parseval) along axis 0; x (T, n)."""
+    x = x - x.mean(0, keepdims=True)
+    T = x.shape[0]
+    X = np.fft.rfft(x, axis=0)
+    f = np.fft.rfftfreq(T, d=1.0 / fs)
+    P = np.abs(X) ** 2 / T ** 2
+    P[1:] *= 2.0
+    if T % 2 == 0:
+        P[-1] /= 2.0
+    return np.sqrt(P[f > cutoff_hz].sum(0))
+
+
+def thrust_noise(policy: dict | None, n: int = 20, seed: int = 11, hold_s: float = 10.0, int8: bool = False,
+                 fw_kwargs: dict | None = None) -> np.ndarray:
+    """HF (> 50 Hz) RMS of the collective-thrust command (N) per vehicle over the
+    hover window of policy_hover (policy=None: the fallback over the window of
+    fallback_hover), sampled at the 500 Hz control rate."""
+    pol = policy if policy is not None else linear_hover_policy()
+    r = SitlRunner(n, randomize=True, seed=seed, policy=pol, log_decimate=1, int8=int8, **(fw_kwargs or {}))
+    r.power_on(POWER_ON_S)
+    if policy is None:
+        t0, t1 = HOVER_T0, HOVER_T1
+        log = r.run(t1, standard_script(arm_t=T_ARM))
+    else:
+        t0, t1 = T_POLICY + 1.0, T_POLICY + 1.0 + hold_s
+        log = r.run(t1, standard_script(arm_t=T_ARM, policy_t=T_POLICY))
+    k = np.nonzero((log.t >= t0) & (log.t < t1))[0][::2]
+    return hf_rms(log["thrust_sp"][k, :, 0].astype(np.float64), 1.0 / (2 * r.dt))
+
+
+def attitude_error_run(policy: dict, kind: str, n: int = 20, seed: int = 21, engage_policy: bool = True,
+                       mahony_kf_ref: bool | None = None) -> dict:
+    """policy_disturbance with the Mahony reference selected; attitude-estimate
+    error / innovation after the disturbance and in the hover before it."""
+    r = policy_disturbance(policy, kind, n=n, seed=seed, keep_log=True, engage_policy=engage_policy,
+                           fw_kwargs=None if mahony_kf_ref is None else dict(mahony_kf_ref=mahony_kf_ref))
+    L = r.log
+    k = L.t >= T_DIST
+    kh = (L.t >= T_DIST - 2.0) & (L.t < T_DIST)
+    te = tilt_error_deg(L["quat"][k], L["est_quat"][k])
+    th = tilt_error_deg(L["quat"][kh], L["est_quat"][kh])
+    return {"n": n, "passed": int(r.passed.sum()), "fault_history": r.fault_history, "att_err_max": te.max(0),
+            "innov_max": L["acc_innov"][k][..., 0].max(0), "hover_att_rms": float(np.sqrt((th ** 2).mean())),
+            "rms_after_m": r.rms_after_m}

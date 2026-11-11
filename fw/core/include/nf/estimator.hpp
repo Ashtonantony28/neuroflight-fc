@@ -24,15 +24,23 @@ class Mahony {
     float innov_lpf_hz = 1.0f; // low-pass on accel-vs-estimate angle (health)
   };
   void init(const Config& c);
-  void reset(const Quat& q = Quat{});
+  // t_s: filter age (>= init_time_s skips the boosted-gain phase; sim/tests).
+  void reset(const Quat& q = Quat{}, float t_s = 0.0f);
   // Level the attitude from one accel sample (roll/pitch, yaw = 0).
   void init_from_accel(const Vec3& accel);
   void update(const Vec3& gyro, const Vec3& accel, float dt);
+  // Same, but the accel is compared with the expected specific force
+  // sf_ref_w (world frame, e.g. KF acceleration estimate + [0,0,g]) instead of
+  // gravity alone: v = normalized(R^T sf_ref_w). With sf_ref_w = [0,0,g] this
+  // is the plain filter up to rounding (FOLLOWUPS 11: without it the estimate
+  // is pulled 8-10 deg off while braking hard).
+  void update(const Vec3& gyro, const Vec3& accel, float dt, const Vec3& sf_ref_w);
   // Seed the gyro bias (e.g. from GyroCalibrator); clamped to bias_limit.
   void set_bias(const Vec3& b);
 
   const Quat& q() const { return q_; }
   const Vec3& bias() const { return bias_; }  // estimated gyro bias (rad/s)
+  const Config& config() const { return c_; }
   Vec3 rates(const Vec3& gyro) const { return gyro - bias_; }
   // Low-passed angle (rad) between measured and predicted gravity direction,
   // updated only on samples that pass the accel gates (|a| and |omega|).
@@ -43,6 +51,7 @@ class Mahony {
   }
 
  private:
+  void update_impl(const Vec3& gyro, const Vec3& accel, float dt, const Vec3* sf_ref_w);
   Config c_{};
   Quat q_{};
   Vec3 bias_{};

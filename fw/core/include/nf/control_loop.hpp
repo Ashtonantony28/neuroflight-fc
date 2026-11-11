@@ -121,6 +121,18 @@ struct ControlLoopConfig {
   float hover_est_lpf_hz = 0.5f;
   float hover_est_min_height_m = 0.15f;
   float hover_est_max_tilt = 0.35f;
+  // Mahony specific-force reference (FOLLOWUPS 11): while armed with a valid
+  // flow/ToF estimate, the accel is compared with KF acceleration + g
+  // (low-passed derivative of the KF velocity, horizontal part clamped)
+  // instead of gravity alone, so hard braking does not pull the attitude off.
+  // false: plain gravity reference (behaviour up to hover_ctbr_v2).
+  bool mahony_kf_ref = true;
+  float mahony_ref_lpf_hz = 5.0f;
+  float mahony_ref_max_acc = 6.0f;  // m/s^2, horizontal clamp (~31 deg of steady tilt)
+  // Soft deadband (m/s^2) on the low-passed estimate (horizontal magnitude and z
+  // separately): hover noise in the KF velocity derivative stays out of the
+  // attitude (it cost fallback hover precision), braking accelerations pass.
+  float mahony_ref_deadband = 0.3f;
   GyroCalibrator::Config gyro_cal{};
   Mahony::Config mahony{};
   TranslationKf::Config kf{};
@@ -170,6 +182,8 @@ class ControlLoop {
   bool armed() const { return armed_; }
   const GyroCalibrator& gyro_cal() const { return cal_; }
   float hover_thrust_estimate() const { return hover_thrust_.value(); }
+  // Low-passed KF acceleration estimate (W) used as the Mahony reference.
+  Vec3 accel_ref() const;
   Vec3 imu_gyro_diff() const { return {gdiff_[0].value(), gdiff_[1].value(), gdiff_[2].value()}; }
   const CascadeController& cascade() const { return cascade_; }
 
@@ -184,6 +198,8 @@ class ControlLoop {
   Pt1 gdiff_[3], adiff_[3];
   int imu_diff_n_ = 0, imu_diff_min_n_ = 500;
   Pt1 hover_thrust_{};
+  Pt1 acc_ref_[3];
+  Vec3 prev_kf_vel_{};
   Mahony mahony_{};
   TranslationKf kf_{};
   RatePid pid_{};

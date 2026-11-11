@@ -100,6 +100,8 @@ NF_API void* nf_sitl_create(int32_t n, const nf_sitl_config* cfg) {
     c.rpm_filter = cfg->rpm_filter != 0;
     if (cfg->gyro_lpf_hz > 0.0f) c.gyro_lpf_hz = cfg->gyro_lpf_hz;
     if (cfg->accel_lpf_hz > 0.0f) c.accel_lpf_hz = cfg->accel_lpf_hz;
+    if (cfg->mahony_kf_ref >= 0) c.mahony_kf_ref = cfg->mahony_kf_ref != 0;
+    if (cfg->mahony_ref_deadband >= 0.0f) c.mahony_ref_deadband = cfg->mahony_ref_deadband;
   }
   c.clock_us = &sim_clock_us;
   Bank* b = new Bank;
@@ -319,6 +321,10 @@ NF_API void nf_sitl_step(void* h, uint64_t now_us, const float* in_f, const int3
     for (int i = 0; i < 4; ++i) of[NF_OUT_ACTION + i] = e.loop.last_action()[i];
     of[NF_OUT_ACC_INNOV] = e.loop.attitude().innovation();
     of[NF_OUT_KF_NIS] = e.loop.translation().nis();
+    {
+      const Vec3 ar = e.loop.accel_ref();
+      for (int i = 0; i < 3; ++i) of[NF_OUT_ACC_REF + i] = ar[i];
+    }
     ou[NF_OUT_ARMED] = o.armed ? 1u : 0u;
     ou[NF_OUT_MODE] = static_cast<uint32_t>(o.mode);
     ou[NF_OUT_ACTIVE_FAULTS] = o.active_faults;
@@ -392,5 +398,46 @@ NF_API void nf_gfilt_step(void* h, const float* gyro, const float* motor_hz, flo
     Vec3 g = v[k].lpf.apply(v3(gyro + 3 * k));
     g = v[k].rpm.apply(g);
     for (int i = 0; i < 3; ++i) out[3 * k + i] = g[i];
+  }
+}
+
+// ---------------------------------------------------------------- Mahony in isolation
+namespace {
+struct MahonyBank {
+  std::vector<Mahony> v;
+};
+}  // namespace
+
+NF_API void* nf_mahony_create(int32_t n) {
+  if (n <= 0) return nullptr;
+  MahonyBank* b = new MahonyBank;
+  b->v.resize(static_cast<size_t>(n));
+  const ControlLoopConfig c{};
+  for (auto& m : b->v) m.init(c.mahony);
+  return b;
+}
+
+NF_API void nf_mahony_destroy(void* h) { delete static_cast<MahonyBank*>(h); }
+
+NF_API void nf_mahony_reset(void* h, const float* q, const float* bias, float t_s) {
+  if (!h) return;
+  auto& v = static_cast<MahonyBank*>(h)->v;
+  for (size_t k = 0; k < v.size(); ++k) {
+    v[k].reset(q ? Quat{q[4 * k], q[4 * k + 1], q[4 * k + 2], q[4 * k + 3]} : Quat{}, t_s);
+    if (bias) v[k].set_bias(v3(bias + 3 * k));
+  }
+}
+
+NF_API void nf_mahony_step(void* h, const float* gyro, const float* accel, const float* sf_ref, float dt,
+                           float* q_out, float* bias_out, float* innov_out) {
+  if (!h) return;
+  auto& v = static_cast<MahonyBank*>(h)->v;
+  for (size_t k = 0; k < v.size(); ++k) {
+    if (sf_ref) v[k].update(v3(gyro + 3 * k), v3(accel + 3 * k), dt, v3(sf_ref + 3 * k));
+    else v[k].update(v3(gyro + 3 * k), v3(accel + 3 * k), dt);
+    const Quat& q = v[k].q();
+    if (q_out) { q_out[4 * k] = q.w; q_out[4 * k + 1] = q.x; q_out[4 * k + 2] = q.y; q_out[4 * k + 3] = q.z; }
+    if (bias_out) for (int i = 0; i < 3; ++i) bias_out[3 * k + i] = v[k].bias()[i];
+    if (innov_out) innov_out[k] = v[k].innovation();
   }
 }

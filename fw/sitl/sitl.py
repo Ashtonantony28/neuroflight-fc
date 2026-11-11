@@ -55,7 +55,7 @@ from sim.quadrotor import Quadrotor  # noqa: E402
 
 BUILD_DIR = os.path.join(HERE, "build")
 LIB_PATH = os.path.join(BUILD_DIR, "libnf_sitl.so")
-ABI_VERSION = 2
+ABI_VERSION = 3
 
 # ---- layouts (mirror fw/sitl/nf_sitl.h)
 IN_GYRO, IN_ACCEL, IN_GYRO_B, IN_ACCEL_B = 0, 3, 6, 9
@@ -63,7 +63,7 @@ IN_FLOW_X, IN_FLOW_Y, IN_FLOW_Q, IN_RANGE, IN_MOTOR_HZ, IN_VBAT, IN_THROTTLE, IN
 (II_B_VALID, II_FLOW_VALID, II_RANGE_VALID, II_RPM_VALID, II_VBAT_VALID, II_LINK_OK, II_ARM, II_KILL,
  II_POLICY_ENABLE, II_REENGAGE, IN_I) = range(11)
 OUT_CMD, OUT_Q, OUT_OMEGA, OUT_POS, OUT_VEL, OUT_THRUST, OUT_RATE_SP, OUT_ACTION = 0, 4, 8, 11, 14, 17, 18, 21
-OUT_ACC_INNOV, OUT_KF_NIS, OUT_F = 25, 26, 27
+OUT_ACC_INNOV, OUT_KF_NIS, OUT_ACC_REF, OUT_F = 25, 26, 27, 30
 (OU_ARMED, OU_MODE, OU_ACTIVE, OU_HISTORY, OU_FIRST, OU_ARM_FAIL, OU_INFER_US, OU_FLAGS, OUT_U) = range(9)
 
 # nf::InputOverride bits (diagnostics)
@@ -144,6 +144,11 @@ def lib():
         L.nf_gfilt_create.restype = vp
         L.nf_gfilt_destroy.argtypes = [vp]
         L.nf_gfilt_step.argtypes = [vp, vp, vp, vp]
+        L.nf_mahony_create.argtypes = [i32]
+        L.nf_mahony_create.restype = vp
+        L.nf_mahony_destroy.argtypes = [vp]
+        L.nf_mahony_reset.argtypes = [vp, vp, vp, f32]
+        L.nf_mahony_step.argtypes = [vp, vp, vp, vp, f32, vp, vp, vp]
         L.nf_ctbr_create.argtypes = [i32, i32]
         L.nf_ctbr_create.restype = vp
         L.nf_ctbr_destroy.argtypes = [vp]
@@ -157,7 +162,8 @@ def lib():
 
 class SitlConfig(ctypes.Structure):
     _fields_ = [("rate_hz", ctypes.c_int32), ("control_hz", ctypes.c_int32), ("hold_height_m", ctypes.c_float),
-                ("rpm_filter", ctypes.c_int32), ("gyro_lpf_hz", ctypes.c_float), ("accel_lpf_hz", ctypes.c_float)]
+                ("rpm_filter", ctypes.c_int32), ("gyro_lpf_hz", ctypes.c_float), ("accel_lpf_hz", ctypes.c_float),
+                ("mahony_kf_ref", ctypes.c_int32), ("mahony_ref_deadband", ctypes.c_float)]
 
 
 def _ptr(a: np.ndarray):
@@ -276,10 +282,13 @@ class Firmware:
     """N firmware instances (nf::ControlLoop) behind the C ABI."""
 
     def __init__(self, n: int, rate_hz=1000, control_hz=500, hold_height_m=1.0, rpm_filter=True,
-                 gyro_lpf_hz=0.0, accel_lpf_hz=0.0):
+                 gyro_lpf_hz=0.0, accel_lpf_hz=0.0, mahony_kf_ref: bool | None = None,
+                 mahony_ref_deadband: float | None = None):
         self.L = lib()
         self.n = n
-        cfg = SitlConfig(rate_hz, control_hz, hold_height_m, int(rpm_filter), gyro_lpf_hz, accel_lpf_hz)
+        cfg = SitlConfig(rate_hz, control_hz, hold_height_m, int(rpm_filter), gyro_lpf_hz, accel_lpf_hz,
+                         -1 if mahony_kf_ref is None else int(bool(mahony_kf_ref)),
+                         -1.0 if mahony_ref_deadband is None else float(mahony_ref_deadband))
         self.h = self.L.nf_sitl_create(n, ctypes.byref(cfg))
         if not self.h:
             raise RuntimeError("nf_sitl_create failed")
@@ -412,6 +421,37 @@ class FirmwareGyroFilter:
         return self.out.copy()
 
 
+class FirmwareMahony:
+    """N instances of nf::Mahony (default config), batched (parity with sim/fw_estimator.py)."""
+
+    def __init__(self, n: int):
+        self.L = lib()
+        self.n = n
+        self.h = self.L.nf_mahony_create(n)
+        self.q = np.zeros((n, 4), np.float32)
+        self.bias = np.zeros((n, 3), np.float32)
+        self.innov = np.zeros(n, np.float32)
+
+    def __del__(self):
+        try:
+            self.L.nf_mahony_destroy(self.h)
+        except Exception:
+            pass
+
+    def reset(self, q: np.ndarray, bias: np.ndarray, t_s: float = 0.0):
+        q = np.ascontiguousarray(q, np.float32)
+        b = np.ascontiguousarray(bias, np.float32)
+        self.L.nf_mahony_reset(self.h, _ptr(q), _ptr(b), float(t_s))
+
+    def step(self, gyro: np.ndarray, accel: np.ndarray, dt: float, sf_ref: np.ndarray | None = None):
+        g = np.ascontiguousarray(gyro, np.float32)
+        a = np.ascontiguousarray(accel, np.float32)
+        r = None if sf_ref is None else np.ascontiguousarray(sf_ref, np.float32)
+        self.L.nf_mahony_step(self.h, _ptr(g), _ptr(a), None if r is None else _ptr(r), float(dt),
+                              _ptr(self.q), _ptr(self.bias), _ptr(self.innov))
+        return self.q.copy(), self.bias.copy(), self.innov.copy()
+
+
 # =========================================================================== RC script
 @dataclass
 class RcScript:
@@ -455,7 +495,7 @@ def standard_script(arm_t=1.5, policy_t: float | None = None, kill_t: float | No
 LOG_FIELDS = {  # name -> per-env width
     "pos": 3, "vel": 3, "quat": 4, "omega": 3, "motor": 4, "cmd": 4,
     "est_pos": 3, "est_vel": 3, "est_quat": 4, "est_omega": 3,
-    "thrust_sp": 1, "rate_sp": 3, "action": 4, "gyro": 3, "acc_innov": 1, "kf_nis": 1,
+    "thrust_sp": 1, "rate_sp": 3, "action": 4, "gyro": 3, "acc_innov": 1, "kf_nis": 1, "acc_ref": 3,
 }
 LOG_UFIELDS = ["armed", "mode", "active_faults", "fault_history", "first_fault", "arm_fail", "inference_us"]
 
@@ -484,6 +524,7 @@ class Log:
         F["action"][k] = out_f[:, OUT_ACTION:OUT_ACTION + 4]
         F["acc_innov"][k, :, 0] = out_f[:, OUT_ACC_INNOV]
         F["kf_nis"][k, :, 0] = out_f[:, OUT_KF_NIS]
+        F["acc_ref"][k] = out_f[:, OUT_ACC_REF:OUT_ACC_REF + 3]
         if in_f is not None:
             F["gyro"][k] = in_f[:, IN_GYRO:IN_GYRO + 3]   # IMU A as fed to the firmware
         for j, name in enumerate(LOG_UFIELDS):

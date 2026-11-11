@@ -66,6 +66,39 @@ TEST(mahony_init_from_accel_and_gating) {
   CHECK(m.q().finite());
 }
 
+TEST(mahony_specific_force_reference_under_sustained_acceleration) {
+  // Coordinated braking: tilted 35 deg, decelerating at g*tan(35 deg), so the
+  // accelerometer sees thrust along body z only. Against gravity the filter
+  // levels itself (wrong); against the true specific force it stays put.
+  const Quat truth = Quat::from_euler(0.0f, 0.61f, 0.0f);
+  const Vec3 sf_w = truth.rotate({0.0f, 0.0f, 9.81f / std::cos(0.61f)});  // a_W + g
+  const Vec3 accel = truth.rotate_inv(sf_w);
+  Mahony plain, ref;
+  plain.init({});
+  ref.init({});
+  plain.reset(truth, 10.0f);
+  ref.reset(truth, 10.0f);
+  for (int i = 0; i < 2000; ++i) {
+    plain.update({0, 0, 0}, accel, 0.001f);
+    ref.update({0, 0, 0}, accel, 0.001f, sf_w);
+  }
+  CHECK(quat_angle(plain.q(), truth) > 0.25f);
+  CHECK(quat_angle(ref.q(), truth) < 1e-3f);
+  CHECK(ref.innovation() < 1e-3f);
+  CHECK(plain.innovation() > 100.0f * ref.innovation());
+  // Reference [0,0,g] reproduces the plain filter.
+  Mahony a, b;
+  a.init({});
+  b.init({});
+  a.reset(Quat::from_euler(0.3f, -0.2f, 0.0f));
+  b.reset(Quat::from_euler(0.3f, -0.2f, 0.0f));
+  for (int i = 0; i < 3000; ++i) {
+    a.update({0.01f, 0, 0}, {0, 0, 9.81f}, 0.001f);
+    b.update({0.01f, 0, 0}, {0, 0, 9.81f}, 0.001f, {0, 0, 9.81f});
+  }
+  CHECK(quat_angle(a.q(), b.q()) < 1e-5f);
+}
+
 TEST(kf_height_and_velocity) {
   TranslationKf kf;
   TranslationKf::Config c;

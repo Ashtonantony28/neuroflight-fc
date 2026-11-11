@@ -510,6 +510,48 @@ TEST(bumpless_fallback_handover_seeds_vertical_integrator) {
   CHECK(lost_old > 3.0f * lost_new);
 }
 
+namespace {
+// FOLLOWUPS 11: hovering in FALLBACK_HOLD, the vehicle is pushed to 3 m/s
+// horizontally (20 ms, felt by the accelerometer as in SITL) and the fallback brakes hard. Returns the peak attitude-estimate
+// tilt error (rad) and peak Mahony innovation during the 3 s after the push.
+void braking_estimate_error(bool kf_ref, float* peak_err, float* peak_innov, uint32_t* faults) {
+  ControlLoopConfig c;
+  c.mahony_kf_ref = kf_ref;
+  Rig r(c);
+  r.sim.gyro_noise = 0.01f;
+  r.sim.acc_noise = 0.1f;
+  r.warmup(1000);
+  r.arm(false);
+  r.run(4000);
+  *peak_err = 0.0f;
+  *peak_innov = 0.0f;
+  for (int i = 0; i < 3000; ++i) {
+    r.sim.ext_acc_w = i < 20 ? Vec3{150.0f, 0.0f, 0.0f} : Vec3{};  // 20 ms push to 3 m/s
+    r.tick();
+    const Vec3 zt = r.sim.q.rotate({0, 0, 1}), ze = r.loop.state().q.rotate({0, 0, 1});
+    *peak_err = std::fmax(*peak_err, std::acos(clampf(dot(zt, ze), -1.0f, 1.0f)));
+    *peak_innov = std::fmax(*peak_innov, r.loop.attitude().innovation());
+  }
+  *faults = r.out.fault_history;
+}
+}  // namespace
+
+TEST(mahony_kf_acceleration_reference_while_braking) {
+  float e_new, i_new, e_old, i_old;
+  uint32_t f_new, f_old;
+  braking_estimate_error(true, &e_new, &i_new, &f_new);
+  braking_estimate_error(false, &e_old, &i_old, &f_old);
+  std::printf("  braking from 3 m/s: peak attitude error %.2f deg (KF-accel ref) vs %.2f deg (gravity ref), "
+              "peak innovation %.3f vs %.3f rad\n", static_cast<double>(e_new * 57.2958f),
+              static_cast<double>(e_old * 57.2958f), static_cast<double>(i_new), static_cast<double>(i_old));
+  CHECK(e_new < 0.05f);         // < 3 deg
+  CHECK(e_old > 2.0f * e_new);  // the gravity reference is pulled off while braking
+  CHECK(i_new < 0.5f * i_old);
+  CHECK_EQ(f_new, 0);
+  CHECK_EQ(f_old & ~static_cast<uint32_t>(FAULT_ESTIMATOR), 0);
+  std::printf("  faults: %u (KF-accel ref) vs %u (gravity ref)\n", f_new, f_old);
+}
+
 TEST(cascade_seed_hover_thrust_sets_level_collective) {
   CascadeController cc;
   CascadeConfig cfg;

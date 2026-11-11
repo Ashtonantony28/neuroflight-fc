@@ -16,6 +16,7 @@ struct QuadSim {
   float t = 0.0f;
   bool ground = true;  // ground plane at z = 0
   Vec3 ext_torque{};   // disturbance (N m)
+  Vec3 ext_acc_w{};    // disturbance acceleration (m/s^2, world; seen by the accelerometer)
   uint32_t rng = 12345;
   float gyro_noise = 0.0f, acc_noise = 0.0f;
   float thrust_scale = 1.0f;  // actual / nominal thrust (weak or strong motors)
@@ -59,7 +60,7 @@ struct QuadSim {
       Vec3 vb = q.rotate_inv(v);
       Vec3 ld{vehicle::kLinDrag[0], vehicle::kLinDrag[1], vehicle::kLinDrag[2]};
       Vec3 fb = Vec3{0, 0, F} - hadamard(ld, vb);
-      Vec3 acc = q.rotate(fb) / vehicle::kMass + Vec3{0, 0, -vehicle::kGravity};
+      Vec3 acc = q.rotate(fb) / vehicle::kMass + Vec3{0, 0, -vehicle::kGravity} + ext_acc_w;
       v += acc * h;
       p += v * h;
       if (ground && p.z <= 0.0f) {
