@@ -13,9 +13,13 @@
     (pos/vel_noise_std); `estimator=True` -> the firmware's flow/ToF Kalman
     filter (sim/fw_estimator.TranslationKf) fed with SITL-identical range and
     flow measurements and the 40 Hz-filtered accelerometer.
-  - attitude: true R, optionally times a fixed per-episode misalignment
-    (`att_misalign_deg`, also used by the KF), standing in for Mahony / IMU
-    mounting error (SITL Mahony error is ~0.1 deg rms in hover).
+  - attitude: `mahony=False` -> true R; `mahony=True` (hover_ctbr_v3) -> the
+    firmware's Mahony estimate (sim/fw_estimator.Mahony on the filtered gyro
+    and 40 Hz accel, specific-force reference KF acceleration + g when
+    `mahony_kf_ref`; its bias estimate replaces the per-episode bias model in
+    obs 12-14 and its innovation feeds the `est_innov` term). Either way
+    optionally times a fixed per-episode misalignment (`att_misalign_deg`,
+    also used by the KF), standing in for IMU mounting error.
 * Auto-reset: envs that are done are reset inside `step`; the returned obs
   for those rows is the post-reset obs, the pre-reset one is in
   info["terminal_obs"]. info["timeout"] marks truncation (bootstrap), and
@@ -29,7 +33,7 @@ from dataclasses import dataclass, field
 import torch
 
 from .ctbr import RateController, RatePIDGains, action_to_ctbr
-from .fw_estimator import GyroFilterChain, TranslationKf
+from .fw_estimator import GyroFilterChain, KfAccelRef, Mahony, Pt1, TranslationKf
 from .params import load_nominal, load_randomization
 from .quadrotor import Quadrotor
 from .rotations import quat_from_axis_angle, quat_to_rotmat, random_tilted_quat
@@ -51,7 +55,10 @@ DEFAULT_REWARD_WEIGHTS = {
     "tilt_pred": 0.0,     # * relu(tilt + 0.1 s * tilt_rate - 50°) gated on tilt_rate (TILT_PREDICTED margin)
     "tilt_excess": 0.0,   # * relu(tilt - 55°)   (TILT monitor margin, 60°)
     "thrust_smooth": 0.0, # * (a0 - a0_prev)^2    (extra thrust-channel smoothness)
-    "est_innov": 0.0,     # * relu(innov_lpf - 0.25 rad): firmware ESTIMATOR monitor margin (Mahony innovation > 0.35 rad)
+    "est_innov": 0.0,     # * relu(innov_lpf - est_innov_thresh): firmware ESTIMATOR monitor margin (Mahony innovation > 0.35 rad)
+    "est_nis": 0.0,       # * relu(kf.nis_lpf - est_nis_thresh): ESTIMATOR monitor margin (KF NIS > 12), needs estimator=True
+    "thrust_jerk": 0.0,   # * (a0 - 2 a0_prev + a0_prev2)^2: high-frequency thrust-command noise (skips the 2 steps after reset)
+    "rate_margin": 0.0,   # * relu(max_i |omega_meas_i| - rate_margin_thresh): RATE monitor margin (12 rad/s for 30 ms)
 }
 
 
@@ -80,6 +87,12 @@ class EnvConfig:
     gyro_bias_resid_std: float = 0.001     # rad/s, bias-estimate error per episode (SITL: ~3e-4)
     estimator: bool = False                # pos/vel obs from the firmware flow/ToF KF
     att_misalign_deg: float = 0.0          # std of a fixed per-episode attitude error (obs + KF)
+    mahony: bool = False                   # attitude obs (and KF rotation) from the firmware Mahony port (needs gyro_filter)
+    mahony_kf_ref: bool = True             # Mahony specific-force reference = KF accel + g (fw ControlLoopConfig::mahony_kf_ref)
+    mahony_ref_deadband: float = 0.3       # m/s^2 (fw ControlLoopConfig::mahony_ref_deadband; v3 was trained with 0)
+    est_innov_thresh: float = 0.25         # rad
+    est_nis_thresh: float = 8.0
+    rate_margin_thresh: float = 10.0       # rad/s
     reward_weights: dict = field(default_factory=lambda: dict(DEFAULT_REWARD_WEIGHTS))
     rate_gains: RatePIDGains = field(default_factory=RatePIDGains)
 
@@ -105,6 +118,8 @@ class QuadEnv:
         self.w = cfg.reward_weights
         self.target = torch.zeros(self.n, 3)
         self.prev_action = torch.zeros(self.n, ACT_DIM)
+        self.prev_a0_2 = torch.zeros(self.n)   # thrust action two steps back (thrust_jerk)
+        self.since_reset = torch.zeros(self.n, dtype=torch.long)
         self.step_count = torch.zeros(self.n, dtype=torch.long)
         self.last_gyro = torch.zeros(self.n, 3)
         self.obs_buf = torch.zeros(self.n, OBS_DIM)
@@ -117,6 +132,18 @@ class QuadEnv:
         self.R_mis = torch.eye(3).expand(self.n, 3, 3).clone()
         self.innov_lpf = torch.zeros(self.n)
         self.innov_k = self.control_dt / (1.0 / (2.0 * math.pi * 1.0) + self.control_dt)
+        self.innov_calm = torch.ones(self.n, dtype=torch.bool)
+        self.fs = fs
+        if cfg.mahony:
+            if not cfg.gyro_filter:
+                raise ValueError("EnvConfig.mahony needs gyro_filter=True (Mahony runs on the filtered gyro)")
+            g = float(self.nom["gravity"])
+            self.mahony = Mahony(self.n, gravity=g)
+            self.acc_lpf = None if self.kf is not None else Pt1((self.n, 3), 40.0, fs)
+            self.acc_ref = KfAccelRef(self.n, fs, gravity=g, deadband=cfg.mahony_ref_deadband) if (cfg.mahony_kf_ref and self.kf is not None) else None
+        else:
+            self.mahony = None
+            self.acc_ref = None
 
     # ------------------------------------------------------------------ helpers
     def _rand(self, *shape):
@@ -162,6 +189,7 @@ class QuadEnv:
         q.set_state(idx, pos=pos, vel=vel, quat=quat, omega=omega, motor=w_h, cmd=w_h)
         self.prev_action[idx] = 0.0
         self.step_count[idx] = 0
+        self.since_reset[idx] = 0
         self.innov_lpf[idx] = 0.0
         self.reinit_sensing(idx)
 
@@ -186,6 +214,13 @@ class QuadEnv:
             ax = torch.randn(m, 3, generator=self.gen)
             ang = torch.randn(m, generator=self.gen).abs() * math.radians(c.att_misalign_deg)
             self.R_mis[idx] = quat_to_rotmat(quat_from_axis_angle(ax / ax.norm(dim=-1, keepdim=True), ang))
+        if self.mahony is not None:
+            # in flight long past init: true attitude, bias estimate as above, innovation 0
+            self.mahony.reset(idx, q.quat[idx], self.bias_est[idx])
+            if self.acc_lpf is not None:
+                self.acc_lpf.y[idx] = q.specific_force_b[idx]
+            if self.acc_ref is not None:
+                self.acc_ref.reset(idx, q.vel[idx])
         if self.kf is not None:
             self.kf.reset(idx, q.pos[idx], q.vel[idx], q.specific_force_b[idx])
         self.rate_ctrl.reset(idx, self.last_gyro[idx].clone())
@@ -219,8 +254,15 @@ class QuadEnv:
         o[idx, 12:15] = self.last_gyro[idx]
         o[idx, 15:19] = self.prev_action[idx]
 
+    def _R_att(self) -> torch.Tensor:
+        """Attitude the firmware works with: Mahony estimate (cfg.mahony) or truth."""
+        if self.mahony is not None:
+            return self.mahony.R()
+        return self.quad.R
+
     def _R_obs(self, idx: torch.Tensor | None = None) -> torch.Tensor:
-        R = self.quad.R if idx is None else self.quad.R[idx]
+        Ra = self._R_att()
+        R = Ra if idx is None else Ra[idx]
         if self.cfg.att_misalign_deg <= 0:
             return R
         Rm = self.R_mis if idx is None else self.R_mis[idx]
@@ -232,6 +274,22 @@ class QuadEnv:
         advances the KF (if enabled)."""
         q = self.quad
         g = q.sample_gyro()
+        if self.mahony is not None:
+            # fw ControlLoop step 1: filtered gyro + 40 Hz accel -> Mahony -> omega = gyro - Mahony bias -> KF
+            gf = self.gfilt.step(g, 400.0 * q.motor)
+            accel = q.sample_accel()
+            acc_f = self.kf.filter_accel(accel) if self.kf is not None else self.acc_lpf.apply(accel)
+            ref = self.acc_ref.sf_ref() if self.acc_ref is not None else None
+            self.mahony.update(gf, acc_f, 1.0 / self.fs, ref)
+            g = gf - self.mahony.bias
+            if self.kf is not None:
+                p = q.params
+                R = self._R_obs()
+                self.kf.predict_filtered(R)
+                self.kf.correct(R, g, q.pos, q.vel, q.R, q.omega, p.pos_noise_std, p.vel_noise_std, self.gen)
+                if self.acc_ref is not None:
+                    self.acc_ref.update(self.kf.v, self.kf.valid())
+            return g
         if self.gfilt is not None:
             g = self.gfilt.step(g, 400.0 * q.motor) - self.bias_est
         if self.kf is not None:
@@ -266,7 +324,7 @@ class QuadEnv:
         return pen_pred, pen_tilt
 
     def _update_innovation(self) -> None:
-        """Proxy of the firmware Mahony health signal (nf::Mahony::innovation;
+        """With cfg.mahony: the real firmware innovation (Mahony port). Else a proxy of the firmware Mahony health signal (nf::Mahony::innovation;
         supervisor ESTIMATOR: > 0.35 rad for 200 ms). On a quadrotor the
         accelerometer sees thrust, not gravity, so the innovation is ~ the
         tilt held while accelerating, and SITL shows the Mahony estimate
@@ -274,6 +332,10 @@ class QuadEnv:
         push). The proxy is the 1 Hz low-pass of the true tilt, WITHOUT the
         firmware's |omega| < 2 rad/s gate: a gated proxy was exploited in
         training (spinning freezes it; RATE trips in SITL)."""
+        if self.mahony is not None:
+            self.innov_lpf = self.mahony.innov
+            self.innov_calm = torch.ones(self.n, dtype=torch.bool)
+            return
         tilt = torch.acos(self.quad.R[:, 2, 2].clamp(-1.0, 1.0))
         self.innov_lpf = self.innov_lpf + self.innov_k * (tilt - self.innov_lpf)
         # the firmware innovation only moves while |omega| < 2 rad/s: penalise only then
@@ -292,6 +354,7 @@ class QuadEnv:
             q.step(self.rate_ctrl(F, rate_sp, gyro))
         self.last_gyro = self._sense()
         self.step_count += 1
+        self.since_reset += 1
         self._update_innovation()
 
         # reward (on true state)
@@ -316,10 +379,18 @@ class QuadEnv:
             pen_pred, pen_tilt = self._envelope_terms()
             rew = rew - w.get("tilt_pred", 0.0) * pen_pred - w.get("tilt_excess", 0.0) * pen_tilt
         if w.get("est_innov", 0.0):
-            rew = rew - w["est_innov"] * (self.innov_lpf - 0.25).clamp_min(0.0) * self.innov_calm
+            rew = rew - w["est_innov"] * (self.innov_lpf - self.cfg.est_innov_thresh).clamp_min(0.0) * self.innov_calm
+        if w.get("est_nis", 0.0) and self.kf is not None:
+            rew = rew - w["est_nis"] * (self.kf.nis_lpf - self.cfg.est_nis_thresh).clamp_min(0.0)
+        if w.get("rate_margin", 0.0):
+            rew = rew - w["rate_margin"] * (self.last_gyro.abs().amax(-1) - self.cfg.rate_margin_thresh).clamp_min(0.0)
         if w.get("thrust_smooth", 0.0):
             rew = rew - w["thrust_smooth"] * (a[:, 0] - self.prev_action[:, 0]) ** 2
+        if w.get("thrust_jerk", 0.0):
+            jerk = a[:, 0] - 2.0 * self.prev_action[:, 0] + self.prev_a0_2
+            rew = rew - w["thrust_jerk"] * torch.where(self.since_reset >= 3, jerk * jerk, torch.zeros_like(jerk))
         rew = torch.where(term, rew - w["crash"], rew)
+        self.prev_a0_2 = self.prev_action[:, 0].clone()
         self.prev_action = a
         self._compute_obs()
         done = term | timeout

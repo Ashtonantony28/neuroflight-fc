@@ -110,3 +110,42 @@ def test_pos_exp_extra_reward():
     _, ra, _, ia = a.step(act)
     _, rb, _, _ = b.step(act)
     assert torch.allclose(rb - ra, 2.0 * torch.exp(-(ia["dist"] / 0.5) ** 2), atol=1e-5)
+
+
+def test_caps_smoothness_terms(small_cfg):
+    """caps (train/ppo.py): the temporal + spatial smoothness terms of the mean
+    action are computed, finite and positive, and vanish for a constant actor."""
+    import copy
+    cfg = copy.deepcopy(small_cfg)
+    cfg["caps"] = {"temporal": 1.0, "spatial": 1.0, "sigma": 0.05}
+    cfg["ppo"]["rollout_steps"] = max(int(cfg["ppo"]["rollout_steps"]), 8)
+    algo = PPO(cfg)
+    s = algo.iterate()
+    assert s["caps_t"] > 0 and s["caps_s"] > 0
+    assert math.isfinite(s["caps_t"]) and math.isfinite(s["caps_s"])
+    # a constant actor (zero weights in the last layer) has no temporal / spatial variation
+    cfg2 = copy.deepcopy(cfg)
+    b = PPO(cfg2)
+    with torch.no_grad():
+        b.actor.net[-2].weight.zero_()
+    cfg2["ppo"]["lr"] = 1e-12
+    b.lr = 1e-12
+    for g_ in b.opt.param_groups:
+        g_["lr"] = 1e-12
+    b.p["kl_target"] = None
+    s2 = b.iterate()
+    assert s2["caps_t"] < 1e-10 and s2["caps_s"] < 1e-10
+
+
+def test_v3_driver_resume_bookkeeping(tmp_path, monkeypatch):
+    """train/v3_driver.py counts the iterations saved in each segment's last.pt."""
+    import train.v3_driver as D
+    monkeypatch.setattr(D, "ROOT", str(tmp_path))
+    (tmp_path / "runs").mkdir()
+    for j, it in ((0, 75), (1, 50)):
+        d = tmp_path / "runs" / f"stg_seg{j}"
+        d.mkdir()
+        torch.save({"iteration": it}, d / "last.pt")
+    (tmp_path / "runs" / "stg_seg2").mkdir()      # killed before its first checkpoint
+    done, ckpt = D.stage_state("stg")
+    assert done == 125 and ckpt.endswith("stg_seg1/last.pt")

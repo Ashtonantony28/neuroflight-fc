@@ -7,11 +7,11 @@ void Mahony::init(const Config& c) {
   reset();
 }
 
-void Mahony::reset(const Quat& q) {
+void Mahony::reset(const Quat& q, float t_s) {
   q_ = q.normalized();
   bias_ = {};
   innov_ = 0.0f;
-  t_ = 0.0f;
+  t_ = t_s;
 }
 
 void Mahony::init_from_accel(const Vec3& a) {
@@ -24,7 +24,13 @@ void Mahony::init_from_accel(const Vec3& a) {
   innov_ = 0.0f;
 }
 
-void Mahony::update(const Vec3& gyro, const Vec3& accel, float dt) {
+void Mahony::update(const Vec3& gyro, const Vec3& accel, float dt) { update_impl(gyro, accel, dt, nullptr); }
+
+void Mahony::update(const Vec3& gyro, const Vec3& accel, float dt, const Vec3& sf_ref_w) {
+  update_impl(gyro, accel, dt, &sf_ref_w);
+}
+
+void Mahony::update_impl(const Vec3& gyro, const Vec3& accel, float dt, const Vec3* sf_ref_w) {
   if (!(dt > 0.0f) || dt > 0.1f) return;
   t_ += dt;
   Vec3 omega = gyro - bias_;
@@ -33,7 +39,13 @@ void Mahony::update(const Vec3& gyro, const Vec3& accel, float dt) {
   const bool calm = norm(omega) < c_.max_rate_for_accel || t_ < c_.init_time_s;
   if (calm && is_finite(an) && an > c_.accel_min_g * g && an < c_.accel_max_g * g) {
     Vec3 a = accel / an;
-    Vec3 v = q_.to_mat().row(2);  // predicted up direction in B = R^T e_z
+    const Mat3 R = q_.to_mat();
+    Vec3 v = R.row(2);  // predicted up direction in B = R^T e_z
+    if (sf_ref_w) {
+      const Vec3 vr = R.tmul(*sf_ref_w);  // expected specific force in B
+      const float vn = norm(vr);
+      if (is_finite(vn) && vn > 1e-3f) v = vr / vn;
+    }
     Vec3 e = cross(a, v);
     float innov_inst = std::atan2(norm(e), dot(a, v));
     float k = dt / (1.0f / (2.0f * kPi * c_.innov_lpf_hz) + dt);

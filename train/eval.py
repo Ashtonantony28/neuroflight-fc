@@ -159,6 +159,9 @@ SENSING = {
     # firmware sensing path (sim/fw_estimator.py): filtered bias-corrected gyro,
     # flow/ToF KF position/velocity -- what the policy sees on the vehicle
     "fw": dict(gyro_filter=True, estimator=True),
+    # + the firmware Mahony attitude estimate (sim/fw_estimator.Mahony, KF-acceleration
+    # reference) for the attitude obs and the KF: the hover_ctbr_v3 training env
+    "fw3": dict(gyro_filter=True, estimator=True, mahony=True, mahony_kf_ref=True),
 }
 
 
@@ -221,6 +224,14 @@ def rollout(env, ctrl, horizon_s=HORIZON_S):
     c_pred = torch.zeros(n, dtype=torch.long)
     c_tilt = torch.zeros(n, dtype=torch.long)
     trip = torch.zeros(n, dtype=torch.bool)
+    # all envelope + estimator monitors ("sup"): the above plus RATE (measured
+    # rate > 12 rad/s on any axis for 30 ms) and, when the env runs the firmware
+    # estimators, ESTIMATOR (Mahony innovation > 0.35 rad or KF NIS > 12 for 200 ms)
+    hold_rate = int(round(0.030 / env.control_dt))
+    hold_est = int(round(0.200 / env.control_dt))
+    c_rate = torch.zeros(n, dtype=torch.long)
+    c_est = torch.zeros(n, dtype=torch.long)
+    sup = torch.zeros(n, dtype=torch.bool)
     for k in range(steps):
         a = ctrl(obs).clamp(-1, 1)
         obs, _, done, info = env.step(a)
@@ -239,7 +250,16 @@ def rollout(env, ctrl, horizon_s=HORIZON_S):
         pred_on = (tr >= 4.0) & (tl + 0.1 * tr.clamp_min(0) > 1.05)
         c_pred = torch.where(pred_on, c_pred + 1, torch.zeros_like(c_pred))
         c_tilt = torch.where(tl > 1.05, c_tilt + 1, torch.zeros_like(c_tilt))
-        trip |= live & ((c_pred >= hold_pred) | (c_tilt >= hold_tilt))
+        trip_k = (c_pred >= hold_pred) | (c_tilt >= hold_tilt)
+        trip |= live & trip_k
+        c_rate = torch.where(env.last_gyro.abs().amax(-1) > 12.0, c_rate + 1, torch.zeros_like(c_rate))
+        est_bad = torch.zeros(n, dtype=torch.bool)
+        if getattr(env, "mahony", None) is not None:
+            est_bad |= env.mahony.innov > 0.35
+        if env.kf is not None:
+            est_bad |= env.kf.nis_lpf > 12.0
+        c_est = torch.where(est_bad, c_est + 1, torch.zeros_like(c_est))
+        sup |= live & (trip_k | (c_rate >= hold_rate) | (c_est >= hold_est))
         newly = (info["crash"] | info["oob"]) & live
         failed |= newly
     final_tilt = torch.rad2deg(torch.acos(env.quad.R[:, 2, 2].clamp(-1, 1)))
@@ -256,7 +276,7 @@ def rollout(env, ctrl, horizon_s=HORIZON_S):
         P[..., -1] /= 2.0
     hf_ms = (P[..., hf_mask]).sum(-1)                              # mean square above cutoff (n, 4)
     return {"success": success, "failed": failed, "err_tail": err_tail, "max_tilt": max_tilt,
-            "settle": last_bad, "trip": trip, "hf_thrust": torch.from_numpy(np.sqrt(hf_ms[:, 0])).float(),
+            "settle": last_bad, "trip": trip, "sup": sup, "hf_thrust": torch.from_numpy(np.sqrt(hf_ms[:, 0])).float(),
             "hf_rates": torch.from_numpy(np.sqrt(hf_ms[:, 1:].mean(-1))).float()}
 
 
@@ -269,6 +289,7 @@ def summarize(res, groups):
         d = {"n": int(ok.numel()), "success": ok.float().mean().item(),
              "crash": res["failed"][s].float().mean().item(),
              "trip": res["trip"][s].float().mean().item(),
+             "sup": res["sup"][s].float().mean().item(),
              "worst_tilt": res["max_tilt"][s][surv].max().item() if surv.any() else float("nan"),
              "p95_tilt": res["max_tilt"][s][surv].quantile(0.95).item() if surv.any() else float("nan"),
              "err_med": res["err_tail"][s][surv].median().item() if surv.any() else float("nan"),
@@ -302,15 +323,13 @@ def format_tables(results: dict, ref: str = "PID") -> str:
     lines = []
     main_groups = [g for g in first if "=" not in g]
     ext_groups = [g for g in first if "=" in g]
-    hdr = "| scenario | " + " | ".join(
-        f"{c} {nm}" for nm in names for c in ("succ%",)) + " | " + " | ".join(
-        f"{nm} err_med m" for nm in names) + " | " + " | ".join(
-        f"{nm} worst/p95 tilt°" for nm in names) + " | " + " | ".join(
-        f"{nm} settle s" for nm in names) + " | " + " | ".join(
-        f"{nm} trip%" for nm in names) + " | " + " | ".join(
-        f"{nm} HF rate/thr" for nm in names) + " |"
-    lines.append(hdr)
-    lines.append("|" + "---|" * (1 + 6 * len(names)))
+    ratio_names = [nm for nm in names if nm != ref] if ref in names else []
+    cols = ([f"succ% {nm}" for nm in names] + [f"{nm} err_med m" for nm in names]
+            + [f"{nm} worst/p95 tilt°" for nm in names] + [f"{nm} settle s" for nm in names]
+            + [f"{nm} trip%" for nm in names] + [f"{nm} sup%" for nm in names]
+            + [f"{nm} HF rate/thr" for nm in names] + [f"{nm} thr/{ref}" for nm in ratio_names])
+    lines.append("| scenario | " + " | ".join(cols) + " |")
+    lines.append("|" + "---|" * (1 + len(cols)))
     for g in main_groups:
         row = [g]
         row += [_f(100 * results[nm][g]["success"], ".1f") for nm in names]
@@ -318,7 +337,9 @@ def format_tables(results: dict, ref: str = "PID") -> str:
         row += [f"{_f(results[nm][g]['worst_tilt'], '.0f')}/{_f(results[nm][g]['p95_tilt'], '.0f')}" for nm in names]
         row += [_f(results[nm][g]["settle_mean"], ".2f") for nm in names]
         row += [_f(100 * results[nm][g].get("trip", float("nan")), ".1f") for nm in names]
+        row += [_f(100 * results[nm][g].get("sup", float("nan")), ".1f") for nm in names]
         row += [f"{_f(results[nm][g]['hf_rates'], '.4f')}/{_f(results[nm][g]['hf_thrust'], '.4f')}" for nm in names]
+        row += [_f(results[nm][g]["hf_thrust"] / results[ref][g]["hf_thrust"], ".2f") for nm in ratio_names]
         lines.append("| " + " | ".join(row) + " |")
     if ext_groups:
         lines.append("")

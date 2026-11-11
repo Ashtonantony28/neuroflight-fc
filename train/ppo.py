@@ -11,6 +11,15 @@
   V(terminal_obs, terminal_priv): r_t += γ V(s_terminal).
 * Curriculum over the env's initial-state distribution (config levels),
   advanced on the EMA of the episode survival rate.
+* Optional action-smoothness regularization on the deterministic (mean)
+  action, CAPS-style (Mysore et al. 2021), config `caps`: a temporal term on
+  the second difference mu(s_t) - 2 mu(s_t-1) + mu(s_t-2) along the rollout
+  (within an episode; the previous-action inputs are replaced by the unrolled
+  mean actions from t-3, since the rollout obs carry the sampled ones) and a spatial term |mu(s) - mu(s + eps)|^2 with eps ~
+  N(0, sigma) in normalized-observation units (dims in `spatial_exclude`
+  untouched, default the previous action), both weighted per action channel. A smoothness penalty in the
+  env reward would act on the sampled action and be swamped by exploration
+  noise; this acts on the policy that is deployed.
 
 Usage: python -m train.ppo --config train/config/hover_ctbr.yaml [--name NAME] [--iterations N]
 """
@@ -327,7 +336,23 @@ class PPO:
         f_adv, f_ret, f_val = adv.reshape(N), ret.reshape(N), b_val.reshape(N)
         mb = N // int(p["minibatches"])
         clip = float(p["clip"])
-        stats = {"pg": 0.0, "vf": 0.0, "kl": 0.0, "ent": 0.0, "clipfrac": 0.0}
+        stats = {"pg": 0.0, "vf": 0.0, "kl": 0.0, "ent": 0.0, "clipfrac": 0.0, "caps_t": 0.0, "caps_s": 0.0}
+        caps = self.cfg.get("caps") or {}
+        w_t, w_s = float(caps.get("temporal", 0.0)), float(caps.get("spatial", 0.0))
+        if w_t or w_s:
+            ch_w = torch.tensor(caps.get("channel_weights", [1.0, 0.25, 0.25, 0.25]), dtype=torch.float32)
+            sigma = float(caps.get("sigma", 0.05))
+            eps_mask = torch.ones(OBS_DIM)
+            eps_mask[list(caps.get("spatial_exclude", [15, 16, 17, 18]))] = 0.0   # previous action is exact
+            t_idx = torch.arange(N) // n
+            done_f = b_done.reshape(N)
+            prev_ok = torch.zeros(N, dtype=torch.bool)
+            okix = torch.nonzero(t_idx >= 3).squeeze(-1)
+            prev_ok[okix] = ~done_f[okix - n] & ~done_f[okix - 2 * n] & ~done_f[okix - 3 * n]
+            a_m, a_s = om[15:19], os_[15:19]
+
+            def with_prev(x, mu):   # obs with the previous-action dims set to the mean action mu
+                return torch.cat((x[:, :15], (mu - a_m) / a_s), -1)
         nupd = 0
         for ep in range(int(p["epochs"])):
             perm = torch.randperm(N, generator=self.gen)
@@ -347,6 +372,24 @@ class PPO:
                     vf = ((v - f_ret[ix]) ** 2).mean()
                 ent = d.entropy().sum(-1).mean()
                 loss = pg + float(p["vf_coef"]) * vf - float(p.get("ent_coef", 0.0)) * ent
+                if w_t:
+                    jx = ix[prev_ok[ix]]
+                    if jx.numel() > 0:
+                        # the rollout obs carry the SAMPLED previous action; on the vehicle it is the mean
+                        # action, so unroll the mean-action feedback from t-3 (states fixed)
+                        mu3 = self.actor(f_obs_n[jx - 3 * n])
+                        mu2 = self.actor(with_prev(f_obs_n[jx - 2 * n], mu3))
+                        mu1 = self.actor(with_prev(f_obs_n[jx - n], mu2))
+                        mu0 = self.actor(with_prev(f_obs_n[jx], mu1))
+                        lt = (((mu0 - 2 * mu1 + mu2) ** 2) * ch_w).sum(-1).mean()
+                        loss = loss + w_t * lt
+                        stats["caps_t"] += lt.item()
+                if w_s:
+                    xo = f_obs_n[ix]
+                    eps = torch.randn(xo.shape, generator=self.gen) * sigma * eps_mask
+                    ls = (((self.actor(xo + eps) - d.mean) ** 2) * ch_w).sum(-1).mean()
+                    loss = loss + w_s * ls
+                    stats["caps_s"] += ls.item()
                 self.opt.zero_grad()
                 loss.backward()
                 nn.utils.clip_grad_norm_(list(self.actor.parameters()) + list(self.critic.parameters()),

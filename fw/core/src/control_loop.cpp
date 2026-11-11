@@ -43,6 +43,8 @@ void ControlLoop::init(const ControlLoopConfig& c) {
   imu_diff_min_n_ = static_cast<int>(c_.arming.imu_diff_min_s * fs + 0.5f);
   hover_thrust_.init(c_.hover_est_lpf_hz, fs);
   hover_thrust_.reset(c_.cascade.mass * c_.cascade.gravity);
+  for (Pt1& f : acc_ref_) { f.init(c_.mahony_ref_lpf_hz, fs); f.reset(0.0f); }
+  prev_kf_vel_ = {};
   mahony_.init(c_.mahony);
   kf_.init(c_.kf);
   pid_.init(c_.rate, fs);
@@ -54,6 +56,19 @@ void ControlLoop::init(const ControlLoopConfig& c) {
   target_ = {0.0f, 0.0f, c_.hold_height_m};
   first_ = true;
   armed_ = false;
+}
+
+Vec3 ControlLoop::accel_ref() const {
+  Vec3 a{acc_ref_[0].value(), acc_ref_[1].value(), acc_ref_[2].value()};
+  const float db = c_.mahony_ref_deadband;
+  if (db > 0.0f) {
+    const float ah = std::sqrt(sq(a.x) + sq(a.y));
+    const float sh = ah > db ? (ah - db) / ah : 0.0f;
+    a.x *= sh;
+    a.y *= sh;
+    a.z = std::fabs(a.z) > db ? a.z - signf(a.z) * db : 0.0f;
+  }
+  return a;
 }
 
 void ControlLoop::set_policy(const FloatModel* m) {
@@ -80,6 +95,8 @@ void ControlLoop::do_arm(uint64_t now, bool use_policy) {
   // vehicle is at rest when armed (WS6 SITL fix: after ~60 s disarmed it had
   // drifted to ~5 m/s and tripped FAULT_ESTIMATOR right after takeoff).
   kf_.reset({0.0f, 0.0f, kf_.pos().z}, {0.0f, 0.0f, kf_.vel().z});
+  prev_kf_vel_ = kf_.vel();
+  for (Pt1& f : acc_ref_) f.reset(0.0f);
   hover_thrust_.reset(c_.cascade.mass * c_.cascade.gravity);
   pid_.reset();
   cascade_.reset();
@@ -138,11 +155,31 @@ MotorOutput ControlLoop::step(const ImuSample& imu, const SensorSample& sens, co
   if (c_.rpm_filter) gyro = rpm_.apply(gyro);
   Vec3 acc = acc_lpf_.apply(imu.accel);
   if (!finite(gyro)) gyro = {};
-  mahony_.update(gyro, acc, dt);
+  if (c_.mahony_kf_ref) {
+    const Vec3 ar = accel_ref();
+    mahony_.update(gyro, acc, dt, {ar.x, ar.y, ar.z + c_.mahony.gravity});
+  } else {
+    mahony_.update(gyro, acc, dt);
+  }
   state_.q = mahony_.q();
   state_.omega = mahony_.rates(gyro);
   kf_.predict(acc, state_.q, dt);
   kf_.correct(sens.flow, sens.range, state_.q, state_.omega);
+  // KF acceleration estimate for the next Mahony update: derivative of the
+  // flow-corrected velocity while the estimate is trustworthy, else decays to 0
+  // (on the ground / without flow: the plain gravity reference).
+  {
+    const Vec3 v = kf_.vel();
+    Vec3 a{};
+    if (c_.mahony_kf_ref && armed_ && kf_.height_valid() && kf_.flow_valid() && finite(v) && finite(prev_kf_vel_))
+      a = (v - prev_kf_vel_) / dt;
+    const float ah = std::sqrt(sq(a.x) + sq(a.y));
+    if (ah > c_.mahony_ref_max_acc) a = {a.x * c_.mahony_ref_max_acc / ah, a.y * c_.mahony_ref_max_acc / ah, a.z};
+    a.z = clampf(a.z, -0.5f * c_.mahony.gravity, 0.5f * c_.mahony.gravity);
+    if (!finite(a)) a = {};
+    for (int i = 0; i < 3; ++i) acc_ref_[i].apply(a[i]);
+    prev_kf_vel_ = v;
+  }
   state_.pos = kf_.pos();
   state_.vel = kf_.vel();
   state_.height_valid = kf_.height_valid();

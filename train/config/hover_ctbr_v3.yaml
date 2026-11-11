@@ -1,0 +1,112 @@
+# PPO fine-tuning stage for CTBR hover / recovery. Read by train/ppo.py.
+run_name: hover_ctbr_v3
+# hover_ctbr_v3: fine-tune hover_ctbr_v2 (runs/v2g/last.pt) with the firmware Mahony attitude
+# estimate in the loop (sim/fw_estimator.Mahony with the KF-acceleration specific-force
+# reference, as fw ControlLoopConfig::mahony_kf_ref; attitude obs and KF rotation come from it),
+# plus margins to the RATE monitor (|omega| > 10 rad/s) and to the ESTIMATOR monitor (real
+# Mahony innovation, KF NIS), and action-smoothness regularization on the deterministic policy
+# (CAPS-style temporal + spatial terms in the PPO loss, `caps` below) against thrust-command noise.
+# Driven by train/v3_driver.py (resumable segments; the container restarts ~hourly):
+#   python -m train.v3_driver
+init_level: 4
+seed: 3
+threads: 4
+randomization: config/randomization.yaml
+reward_scale: 0.02
+log_every: 10
+checkpoint_every: 25
+
+env:
+  num_envs: 2048
+  use_nominal: false
+  episode_len_s: 3.0
+  randomize_initial_time: true
+  target_xy: 1.0
+  target_z: [0.8, 2.2]
+  init_min_z: 0.5
+  gyro_filter: true
+  gyro_bias_resid_std: 0.001
+  estimator: true
+  mahony: true
+  mahony_kf_ref: true
+  mahony_ref_deadband: 0.0    # v3 was trained before the firmware got its 0.3 m/s^2 deadband (default now)
+  att_misalign_deg: 1.0
+  est_innov_thresh: 0.25
+  est_nis_thresh: 8.0
+  rate_margin_thresh: 10.0
+  oob_dist: 3.0
+  max_rate_term: 40.0
+
+reward_weights:
+  alive: 5.0
+  pos: 3.0
+  vel: 0.5
+  upright: 1.0
+  rate: 0.02
+  yaw_rate: 0.02
+  action: 0.02
+  smooth: 1.0
+  crash: 100.0
+  tilt_pred: 100.0
+  tilt_excess: 10.0
+  thrust_smooth: 2.0
+  thrust_jerk: 0.0            # off: on the sampled action it is swamped by exploration noise (std 0.05-0.1); see caps
+  est_innov: 30.0             # * rad of real Mahony innovation over 0.25 (ESTIMATOR: 0.35 rad for 200 ms)
+  est_nis: 0.3                # * KF low-passed NIS over 8 (ESTIMATOR: 12 for 200 ms); flips make it large regardless
+  rate_margin: 5.0            # * rad/s of max |omega_meas| over 10 (RATE: 12 rad/s for 30 ms)
+
+reward_ramp: {}
+
+# Smoothness of the deterministic policy (train/ppo.py): temporal = weight on the mean action's
+# second difference along the rollout, spatial = weight on |mu(s) - mu(s + N(0, sigma))|^2 in
+# normalized obs units (sigma 0.05 ~ 0.1 rad/s rate / 0.04 m/s velocity noise), channels
+# weighted [thrust, roll, pitch, yaw]. v2 starts at temporal ~4.4e-4, spatial ~2.7e-4 (x weight ~0.03 vs pg ~0.01-0.04).
+caps:
+  temporal: 60.0
+  spatial: 60.0
+  sigma: 0.05
+  channel_weights: [1.0, 0.25, 0.25, 0.25]
+  # position error (0-2) excluded: sigma 0.05 there is ~2 cm and cost hover precision
+  # (stage-1 policy with it: SITL hover median 5.5 cm); previous action (15-18) is exact
+  spatial_exclude: [0, 1, 2, 15, 16, 17, 18]
+
+extra_reward:
+  pos_exp: {weight: 3.0, sigma: 0.15}
+  pos_exp2: {weight: 3.0, sigma: 0.04}
+
+model:
+  actor_hidden: [64, 64]
+  critic_hidden: [128, 128]
+  hover_bias_init: true
+
+reset_log_std: false
+
+ppo:
+  iterations: 2000
+  rollout_steps: 64
+  epochs: 4
+  minibatches: 4
+  gamma: 0.997
+  lam: 0.99
+  clip: 0.2
+  lr: 2.0e-4
+  kl_target: 0.01
+  lr_min: 1.0e-5
+  lr_max: 5.0e-4
+  vf_coef: 1.0
+  value_clip: false
+  ent_coef: 0.0
+  max_grad_norm: 1.0
+  init_log_std: -2.3
+  min_log_std: -3.0
+
+curriculum:
+  ema: 0.9
+  advance_success: 0.9
+  min_iters: 40
+  levels:
+    - {init_max_tilt_deg: 15,  init_pos_offset: 0.3, init_max_vel: 0.3, init_max_rate: 0.5, init_upside_down_prob: 0.0}
+    - {init_max_tilt_deg: 45,  init_pos_offset: 0.7, init_max_vel: 1.0, init_max_rate: 2.0, init_upside_down_prob: 0.0}
+    - {init_max_tilt_deg: 75,  init_pos_offset: 1.0, init_max_vel: 1.5, init_max_rate: 4.0, init_upside_down_prob: 0.0}
+    - {init_max_tilt_deg: 100, init_pos_offset: 1.0, init_max_vel: 2.0, init_max_rate: 7.0, init_upside_down_prob: 0.1}
+    - {init_max_tilt_deg: 120, init_pos_offset: 1.0, init_max_vel: 2.5, init_max_rate: 10.0, init_upside_down_prob: 0.2}

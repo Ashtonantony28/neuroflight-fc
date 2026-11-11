@@ -70,6 +70,9 @@ def main():
     v2 = S.trained_policy(S.TRAINED_POLICY_V2)
     v2q_path = S.TRAINED_POLICY_V2.replace(".nfpol.json", ".q.nfpol.json")
     v2q = sitl.load_nfpol(v2q_path) if os.path.exists(v2q_path) else None
+    v3 = S.trained_policy(S.TRAINED_POLICY_V3)
+    v3q_path = S.TRAINED_POLICY_V3.replace(".nfpol.json", ".q.nfpol.json")
+    v3q = sitl.load_nfpol(v3q_path) if os.path.exists(v3q_path) else None
 
     print("hover ...")
     hov = [S.fallback_hover(1), S.fallback_hover(nr, randomize=True, seed=1),
@@ -85,16 +88,38 @@ def main():
                   S.policy_hover(v2, n=nr, randomize=True, seed=11, name="trained hover_ctbr_v2")]
     if v2q is not None:
         pol_h += [S.policy_hover(v2q, n=nr, randomize=True, seed=11, name="hover_ctbr_v2 int8 (nf::Int8Model)", int8=True)]
+    if v3 is not None:
+        pol_h += [S.policy_hover(v3, name="trained hover_ctbr_v3"),
+                  S.policy_hover(v3, n=nr, randomize=True, seed=11, name="trained hover_ctbr_v3")]
+    if v3q is not None:
+        pol_h += [S.policy_hover(v3q, n=nr, randomize=True, seed=11, name="hover_ctbr_v3 int8 (nf::Int8Model)", int8=True)]
+    print("thrust noise ...")
+    tn = []
+    for label, pol in (("fallback (cascaded PID)", None), ("hover_ctbr_v2", v2), ("hover_ctbr_v3", v3)):
+        if label.startswith("fallback") or pol is not None:
+            tn.append((label, S.thrust_noise(pol, n=nr, seed=11)))
     print("policy disturbances ...")
     dist = []
-    for label, pol, i8 in (("hover_ctbr_v1", trained, False), ("hover_ctbr_v2", v2, False), ("hover_ctbr_v2 int8", v2q, True)):
+    for label, pol, i8 in (("hover_ctbr_v1", trained, False), ("hover_ctbr_v2", v2, False), ("hover_ctbr_v2 int8", v2q, True),
+                           ("hover_ctbr_v3", v3, False), ("hover_ctbr_v3 int8", v3q, True)):
         if pol is None:
             continue
         for kind in ("tilt", "throw"):
             dist.append((label, kind, S.policy_disturbance(pol, kind, n=nr, seed=21, int8=i8)))
-    if v2 is not None:
-        dist.append(("hover_ctbr_v2", "throw, |dw| <= 10 rad/s (stress, informational)",
-                     S.policy_disturbance(v2, "throw", n=nr, seed=21, throw_dw_max=10.0)))
+    for label, pol in (("hover_ctbr_v2", v2), ("hover_ctbr_v3", v3)):
+        if pol is not None:
+            dist.append((label, "throw, |dw| <= 10 rad/s (stress, informational)",
+                         S.policy_disturbance(pol, "throw", n=nr, seed=21, throw_dw_max=10.0)))
+    print("Mahony reference ...")
+    mref = []
+    for label, pol, eng in (("fallback", v2 or sitl.linear_hover_policy(), False), ("hover_ctbr_v2", v2, True),
+                            ("hover_ctbr_v3", v3, True)):
+        if pol is None:
+            continue
+        for kind in ("throw", "tilt"):
+            for ref in (False, True):
+                mref.append((label, kind, ref, S.attitude_error_run(pol, kind, n=nr, seed=21, engage_policy=eng,
+                                                                    mahony_kf_ref=ref)))
     print("gap attribution ...")
     import diagnose_gap as DG
     gap_rows = []
@@ -120,6 +145,7 @@ def main():
     par_cl = S.ctbr_parity_closed_loop()
     par_env = S.ctbr_parity_random(sim_reset_with_gyro=False)
     gfp = S.gyro_filter_parity()
+    mp0, mp1 = S.mahony_parity(t0=0.0), S.mahony_parity(t0=10.0)
     gap_raw = S.ctbr_full_loop_gap(sim_filter=False)
     gap = S.ctbr_full_loop_gap(sim_filter=True)
 
@@ -130,7 +156,8 @@ def main():
       "(sim latency + motor lag per vehicle). The sensors are IMU A and IMU B at 1 kHz, and ToF and optical flow at 100 Hz. "
       f"Each run starts with the vehicle powered on and still on the ground for {S.POWER_ON_S:.0f} s. It is then armed into FALLBACK_HOLD and takes off to 1 m. "
       f"Policy runs switch to POLICY with the RC re-engage at t={S.T_POLICY:.0f} s, and faults are injected at t={S.T_FAULT:.0f} s.\n")
-    for path, pol in ((S.TRAINED_POLICY, trained), (S.TRAINED_POLICY_V2, v2), (v2q_path, v2q)):
+    for path, pol in ((S.TRAINED_POLICY, trained), (S.TRAINED_POLICY_V2, v2), (v2q_path, v2q), (S.TRAINED_POLICY_V3, v3),
+                      (v3q_path, v3q)):
         w(f"Trained policy `{os.path.relpath(path, sitl.ROOT)}`: "
           f"{'present' if pol is not None else '**not present** (rows skipped)'}.\n")
 
@@ -160,7 +187,18 @@ def main():
       "and thrust, because it has no integrator.\n")
     w("hover_ctbr_v1 was trained on true attitude/velocity (+ white noise) and the raw gyro; hover_ctbr_v2 on the firmware sensing "
       "path (sim/fw_estimator.py). The int8 row flies the quantized v2 through the firmware's int8 inference "
-      "(`nf_sitl_set_policy_i8` -> `nf::Int8Model`).\n")
+      "(`nf_sitl_set_policy_i8` -> `nf::Int8Model`). hover_ctbr_v3 adds the firmware Mahony estimate (with the KF-acceleration "
+      "reference) to the training sim, RATE / ESTIMATOR margins and thrust-noise shaping (train/policies/hover_ctbr_v3.md). "
+      "All rows fly the current firmware (Mahony KF-acceleration reference on, see (b2)).\n")
+    if tn:
+        w("Thrust-command noise in POLICY hover (FALLBACK_HOLD for the fallback), same 10 s window and vehicles as the hover rows: "
+          "RMS of the collective-thrust command above 50 Hz (N), and the ratio to the fallback's cascaded PID.\n")
+        w("| controller | HF thrust rms med (N) | ratio to fallback |")
+        w("|---|---|---|")
+        ref_tn = np.median(tn[0][1])
+        for label, v in tn:
+            w(f"| {label} | {np.median(v):.4f} | {np.median(v) / ref_tn:.2f} |")
+        w("")
     if dist:
         w("### Policy recovery from disturbances (randomized vehicles)\n")
         w(f"At t = {S.T_DIST:.0f} s, 3 s after the POLICY engage. **tilt**: an external 'hand' holds the vehicle in place and rotates it "
@@ -178,6 +216,23 @@ def main():
             w(f"| {label} | {kind} | {int(r.passed.sum())}/{len(r.passed)} | {nt} {'(' + ','.join(trips) + ')' if trips else ''} | "
               f"{np.median(r.max_tilt_deg):.0f} / {r.max_tilt_deg.max():.0f} | {np.nanmedian(r.recover_s):.2f} / {np.nanmax(r.recover_s):.2f} | "
               f"{np.median(r.peak_err_m):.2f} | {cm(np.median(r.rms_after_m))} |")
+        w("")
+    if mref:
+        w("### (b2) Mahony specific-force reference (FOLLOWUPS 11)\n")
+        w("The firmware Mahony filter compares the accelerometer with the expected specific force. Up to v2 that was gravity "
+          "alone, so while the vehicle accelerates (hard braking after a push) the estimate is pulled towards level. "
+          "`ControlLoopConfig::mahony_kf_ref` (now default) uses KF acceleration + g instead: a 5 Hz low-pass of the derivative "
+          "of the flow-corrected KF velocity while armed with valid flow/height (horizontal part clamped to 6 m/s^2, then a 0.3 m/s^2 "
+          "soft deadband so hover noise stays out of the attitude: without it the fallback hover lost ~1 cm on some vehicles), else gravity. "
+          "Same disturbances as above; attitude error = angle between true and estimated body z axes after the disturbance.\n")
+        w("| controller | disturbance | reference | pass | trips | att err max med / max (deg) | innovation max med / max (rad) | hover att err rms (deg) |")
+        w("|---|---|---|---|---|---|---|---|")
+        for label, kind, ref, m in mref:
+            trips = sorted({f for b in m["fault_history"] for f in sitl.fault_names(int(b))})
+            nt = int((m["fault_history"] != 0).sum())
+            w(f"| {label} | {kind} | {'KF accel + g' if ref else 'gravity'} | {m['passed']}/{m['n']} | "
+              f"{nt} {'(' + ','.join(trips) + ')' if trips else ''} | {np.median(m['att_err_max']):.1f} / {m['att_err_max'].max():.1f} | "
+              f"{np.median(m['innov_max']):.3f} / {m['innov_max'].max():.3f} | {m['hover_att_rms']:.2f} |")
         w("")
     if gap_rows:
         w("### Sim-to-real gap attribution (`fw/sitl/diagnose_gap.py`)\n")
@@ -227,6 +282,10 @@ def main():
       f"{par_env['mean_abs']:.1e} | first step {par_env['first_step_max_abs']:.3f}; {par_env['frac_gt_tol']:.0%} of samples > tol |")
     w(f"| gyro filter chain: sim/fw_estimator.GyroFilterChain vs firmware LPF + RPM notches (rad/s), 32 x 5000 | {gfp['max_abs']:.1e} | | "
       f"{gfp['notch_toggles']} notch (de)activations |")
+    w(f"| Mahony: sim/fw_estimator.Mahony vs nf::Mahony, 32 x 20000, random gyro/accel, KF-accel reference on every other step, "
+      f"{mp0['gated_frac']:.0%} of samples inside the 2 rad/s accel gate | q {max(mp0['q_max_abs'], mp1['q_max_abs']):.1e} | | "
+      f"bias {max(mp0['bias_max_abs'], mp1['bias_max_abs']):.1e} rad/s, innovation {max(mp0['innov_max_abs'], mp1['innov_max_abs']):.1e} rad "
+      f"(from t = 0 incl. the boosted-gain phase, and in flight) |")
     w(f"| full firmware loop vs sim measurement path + sim/ctbr.py (whole armed flight replayed) | {gap['max_abs']:.1e} | rms {gap['rms']:.1e} | "
       f"Mahony bias drift {gap['bias_drift']:.1e} rad/s (replay uses a constant bias) |")
     w(f"| same, raw gyro into sim/ctbr.py (v1 training path) | {gap_raw['max_abs']:.4f} | rms {gap_raw['rms']:.4f} | "
@@ -268,6 +327,11 @@ def main():
       "the policy, trained on white per-step noise, answers it with 20-37 deg tilts and TILT_PREDICTED trips; true attitude, "
       "gyro path and position matter little. v2 is trained on a port of the firmware sensing path "
       "(sim/fw_estimator.py: gyro filter chain + TranslationKf with SITL-identical range/flow) plus supervisor-envelope shaping.")
+    w("9. **Mahony in the training sim (FOLLOWUPS 8) and KF-acceleration reference (FOLLOWUPS 11).** `sim/fw_estimator.Mahony` "
+      "ports `nf::Mahony` (gating, bias integral, innovation; parity in table (e)), so training sees the firmware's attitude "
+      "estimate and its real innovation. The firmware now compares the accelerometer with KF acceleration + g "
+      "(table (b2)): the 8-14 deg attitude error while braking hard drops to about 1-2 deg and the ESTIMATOR trips on pushes are gone, "
+      "at the cost of ~0.1 deg more attitude noise in hover.")
     open(OUT, "w").write("\n".join(L) + "\n")
     print(f"wrote {OUT} in {time.time() - t0:.0f} s")
 

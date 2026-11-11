@@ -161,18 +161,39 @@ class TranslationKf:
         self.acc = torch.zeros(n, 3)
         self.height_age = torch.zeros(n)
         self.flow_age = torch.zeros(n)
+        self.nis_lpf = torch.zeros(n)   # nf::TranslationKf::nis() (supervisor ESTIMATOR: > 12 for 200 ms)
+        rc_n = torch.tensor(1.0, dtype=F32) / (torch.tensor(2.0, dtype=F32) * torch.tensor(3.14159265358979, dtype=F32)
+                                              * torch.tensor(2.0, dtype=F32))
+        dtt = torch.tensor(self.dt, dtype=F32)
+        self.nis_k = dtt / (rc_n + dtt)
         self.tick = 0
 
     def reset(self, idx, p, v, acc_b) -> None:
         self.p[idx], self.v[idx] = p, v
         self.P00[idx], self.P01[idx], self.P11[idx] = 0.01, 0.0, 0.01
         self.acc[idx] = acc_b
+        # firmware reset() sets the ages to 1e3 (invalid until the first update);
+        # the sim resets in flight, as if the sensors had just been updated
         self.height_age[idx] = 0.0
         self.flow_age[idx] = 0.0
+        self.nis_lpf[idx] = 0.0
+
+    def filter_accel(self, accel_b: torch.Tensor) -> torch.Tensor:
+        """The firmware's 40 Hz PT1 accel filter (ControlLoop acc_lpf_); also the Mahony input."""
+        self.acc = self.acc + self.acc_k * (accel_b - self.acc)
+        return self.acc
+
+    def valid(self) -> torch.Tensor:
+        """height_valid() && flow_valid() (VehicleState::pos_valid)."""
+        return (self.height_age < 0.2) & (self.flow_age < 0.2)
 
     def predict(self, accel_b: torch.Tensor, R: torch.Tensor) -> None:
+        self.filter_accel(accel_b)
+        self.predict_filtered(R)
+
+    def predict_filtered(self, R: torch.Tensor) -> None:
+        """Propagate with the already filtered accel (`filter_accel`)."""
         dt = self.dt
-        self.acc = self.acc + self.acc_k * (accel_b - self.acc)
         aw = torch.einsum("nij,nj->ni", R, self.acc)
         aw[:, 2] -= self.g
         aw = torch.where(torch.isfinite(aw), aw, torch.zeros_like(aw))
@@ -193,7 +214,9 @@ class TranslationKf:
         y = z - hx
         Pii = P00 if idx == 0 else P11
         s = Pii + r2
-        ok = mask & ((y * y / s) <= self.gate)
+        nis = y * y / s
+        self.nis_lpf = torch.where(mask, self.nis_lpf + self.nis_k * (nis - self.nis_lpf), self.nis_lpf)
+        ok = mask & (nis <= self.gate)
         P0i = P00 if idx == 0 else P01
         P1i = P01 if idx == 0 else P11
         k0, k1 = P0i / s, P1i / s
@@ -245,3 +268,202 @@ class TranslationKf:
         ok0 = self._update(0, 1, vw[:, 0], self.r2_flow, m_f)
         ok1 = self._update(1, 1, vw[:, 1], self.r2_flow, m_f)
         self.flow_age = torch.where(ok0 & ok1, torch.zeros_like(self.flow_age), self.flow_age)
+
+
+class Pt1:
+    """Batched nf::Pt1 (first-order low-pass, k = dt / (rc + dt), float32)."""
+
+    def __init__(self, shape, cutoff_hz: float, fs: float):
+        rc = torch.tensor(1.0, dtype=F32) / (torch.tensor(2.0, dtype=F32) * torch.tensor(3.14159265358979, dtype=F32)
+                                            * torch.tensor(cutoff_hz, dtype=F32))
+        dt = torch.tensor(1.0, dtype=F32) / torch.tensor(fs, dtype=F32)
+        self.k = dt / (rc + dt)
+        self.y = torch.zeros(shape)
+
+    def apply(self, x: torch.Tensor) -> torch.Tensor:
+        self.y = self.y + self.k * (x.to(F32) - self.y)
+        return self.y
+
+
+def _quat_to_mat(q: torch.Tensor) -> torch.Tensor:
+    """nf::Quat::to_mat (B->W), same op order. q (N,4) w,x,y,z -> (N,3,3)."""
+    w, x, y, z = q.unbind(-1)
+    ww, xx, yy, zz = w * w, x * x, y * y, z * z
+    r = torch.stack((
+        ww + xx - yy - zz, 2 * (x * y - w * z), 2 * (x * z + w * y),
+        2 * (x * y + w * z), ww - xx + yy - zz, 2 * (y * z - w * x),
+        2 * (x * z - w * y), 2 * (y * z + w * x), ww - xx - yy + zz), -1)
+    return r.reshape(q.shape[0], 3, 3)
+
+
+def _norm3(v: torch.Tensor) -> torch.Tensor:
+    return torch.sqrt(v[:, 0] * v[:, 0] + v[:, 1] * v[:, 1] + v[:, 2] * v[:, 2])
+
+
+def _cross(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    return torch.stack((a[:, 1] * b[:, 2] - a[:, 2] * b[:, 1],
+                        a[:, 2] * b[:, 0] - a[:, 0] * b[:, 2],
+                        a[:, 0] * b[:, 1] - a[:, 1] * b[:, 0]), -1)
+
+
+def _quat_mul(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    w, x, y, z = a.unbind(-1)
+    bw, bx, by, bz = b.unbind(-1)
+    return torch.stack((w * bw - x * bx - y * by - z * bz, w * bx + x * bw + y * bz - z * by,
+                        w * by - x * bz + y * bw + z * bx, w * bz + x * by - y * bx + z * bw), -1)
+
+
+def _quat_normalized(q: torch.Tensor) -> torch.Tensor:
+    n = torch.sqrt(q[:, 0] * q[:, 0] + q[:, 1] * q[:, 1] + q[:, 2] * q[:, 2] + q[:, 3] * q[:, 3])
+    ok = (n > 1e-12).unsqueeze(-1)
+    ident = torch.zeros_like(q)
+    ident[:, 0] = 1.0
+    return torch.where(ok, q / n.clamp_min(1e-30).unsqueeze(-1), ident)
+
+
+def quat_integrated(q: torch.Tensor, omega: torch.Tensor, dt: float) -> torch.Tensor:
+    """nf::Quat::integrated: q * exp(0.5 omega dt), normalized."""
+    dtt = torch.tensor(dt, dtype=F32)
+    n = _norm3(omega)
+    ang = n * dtt
+    big = ang > 1e-9
+    a = torch.where((n > 1e-12).unsqueeze(-1), omega / n.clamp_min(1e-30).unsqueeze(-1), torch.zeros_like(omega))
+    half = 0.5 * ang
+    s = torch.sin(half)
+    dq_big = torch.cat((torch.cos(half).unsqueeze(-1), a * s.unsqueeze(-1)), -1)
+    dq_small = torch.cat((torch.ones_like(n).unsqueeze(-1), 0.5 * omega * dtt), -1)
+    dq = torch.where(big.unsqueeze(-1), dq_big, dq_small)
+    return _quat_normalized(_quat_mul(q, dq))
+
+
+class Mahony:
+    """Batched port of nf::Mahony (default Config; fw/core/src/estimator.cpp),
+    float32, same op order: accel correction (and bias integral) only while
+    |gyro - bias| < max_rate_for_accel (2 rad/s) and |a| in [0.5, 1.5] g;
+    `innov` = 1 Hz low-pass of the angle between the measured accel and the
+    predicted direction (the supervisor's ESTIMATOR input, > 0.35 rad for
+    200 ms trips it). With `sf_ref` (world-frame expected specific force, the
+    firmware's KF acceleration + g reference, FOLLOWUPS 11) the prediction is
+    normalized(R^T sf_ref) instead of R^T e_z.
+
+    Input gyro is the firmware's filtered gyro (GyroFilterChain output, NOT
+    bias-corrected); accel the 40 Hz PT1-filtered accelerometer. Parity with
+    the C++ is tested in test/sitl (`nf_mahony_*`)."""
+
+    def __init__(self, n: int, kp: float = 1.0, ki: float = 0.05, kp_init: float = 10.0, init_time_s: float = 1.0,
+                 accel_min_g: float = 0.5, accel_max_g: float = 1.5, max_rate_for_accel: float = 2.0,
+                 bias_limit: float = 0.2, gravity: float = 9.81, innov_lpf_hz: float = 1.0):
+        self.n = n
+        self.kp, self.ki, self.kp_init, self.init_time = kp, ki, kp_init, init_time_s
+        self.amin, self.amax, self.max_rate = accel_min_g, accel_max_g, max_rate_for_accel
+        self.bias_limit, self.g, self.innov_hz = bias_limit, gravity, innov_lpf_hz
+        self.q = torch.zeros(n, 4)
+        self.q[:, 0] = 1.0
+        self.bias = torch.zeros(n, 3)
+        self.innov = torch.zeros(n)
+        self.t = torch.zeros(n)
+        self._kcache = {}
+
+    def reset(self, idx, q: torch.Tensor, bias: torch.Tensor | None = None, t_s: float = 10.0) -> None:
+        """Like nf::Mahony::reset(q, t_s) + set_bias(bias). Default age 10 s:
+        a vehicle in flight is long past the boosted-gain init phase."""
+        self.q[idx] = _quat_normalized(q.to(F32))
+        self.bias[idx] = 0.0 if bias is None else bias.to(F32).clamp(-self.bias_limit, self.bias_limit)
+        self.innov[idx] = 0.0
+        self.t[idx] = float(t_s)
+
+    def R(self) -> torch.Tensor:
+        return _quat_to_mat(self.q)
+
+    def _k(self, dt: float):
+        k = self._kcache.get(dt)
+        if k is None:
+            one, two = torch.tensor(1.0, dtype=F32), torch.tensor(2.0, dtype=F32)
+            pi = torch.tensor(3.14159265358979, dtype=F32)
+            d = torch.tensor(dt, dtype=F32)
+            k = d / (one / (two * pi * torch.tensor(self.innov_hz, dtype=F32)) + d)
+            self._kcache[dt] = k
+        return k
+
+    def update(self, gyro: torch.Tensor, accel: torch.Tensor, dt: float, sf_ref: torch.Tensor | None = None) -> None:
+        dtt = torch.tensor(dt, dtype=F32)
+        self.t = self.t + dtt
+        omega = gyro.to(F32) - self.bias
+        accel = accel.to(F32)
+        an = _norm3(accel)
+        g = torch.tensor(self.g, dtype=F32)
+        init = self.t < self.init_time
+        calm = (_norm3(omega) < self.max_rate) | init
+        gate = calm & torch.isfinite(an) & (an > self.amin * g) & (an < self.amax * g)
+        a = accel / torch.where(gate, an, torch.ones_like(an)).unsqueeze(-1)
+        R = _quat_to_mat(self.q)
+        v = R[:, 2, :]
+        if sf_ref is not None:
+            r = sf_ref.to(F32)
+            # R^T r: dot(col(i), r)
+            vr = torch.stack([R[:, 0, i] * r[:, 0] + R[:, 1, i] * r[:, 1] + R[:, 2, i] * r[:, 2] for i in range(3)], -1)
+            vn = _norm3(vr)
+            ok = (torch.isfinite(vn) & (vn > 1e-3)).unsqueeze(-1)
+            v = torch.where(ok, vr / torch.where(ok.squeeze(-1), vn, torch.ones_like(vn)).unsqueeze(-1), v)
+        e = _cross(a, v)
+        dav = a[:, 0] * v[:, 0] + a[:, 1] * v[:, 1] + a[:, 2] * v[:, 2]
+        innov_inst = torch.atan2(_norm3(e), dav)
+        k = self._k(dt)
+        self.innov = torch.where(gate, self.innov + k * (innov_inst - self.innov), self.innov)
+        kp = torch.where(init, torch.tensor(self.kp_init, dtype=F32), torch.tensor(self.kp, dtype=F32))
+        if self.ki > 0.0:
+            nb = (self.bias - e * (torch.tensor(self.ki, dtype=F32) * dtt)).clamp(-self.bias_limit, self.bias_limit)
+            self.bias = torch.where((gate & ~init).unsqueeze(-1), nb, self.bias)
+        omega = torch.where(gate.unsqueeze(-1), omega + e * kp.unsqueeze(-1), omega)
+        qn = quat_integrated(self.q, omega, dt)
+        self.q = torch.where(torch.isfinite(qn).all(-1, keepdim=True), qn, self.q)
+
+
+class KfAccelRef:
+    """The firmware's Mahony specific-force reference (ControlLoop,
+    `mahony_kf_ref`): 5 Hz PT1 of the KF velocity derivative while armed with
+    valid height + flow (else the input is 0), horizontal part clamped to
+    6 m/s^2, vertical to +-g/2. `value()` is the KF acceleration estimate
+    after the soft deadband (ControlLoop::accel_ref, `mahony_ref_deadband`,
+    horizontal magnitude and z separately); the Mahony reference is
+    value() + [0, 0, g]."""
+
+    def __init__(self, n: int, fs: float = 1000.0, lpf_hz: float = 5.0, max_acc: float = 6.0, gravity: float = 9.81,
+                 deadband: float = 0.3):
+        self.fs, self.max_acc, self.g, self.db = fs, max_acc, gravity, deadband
+        self.dt = torch.tensor(1.0, dtype=F32) / torch.tensor(fs, dtype=F32)
+        self.lpf = Pt1((n, 3), lpf_hz, fs)
+        self.prev_v = torch.zeros(n, 3)
+
+    def reset(self, idx, v: torch.Tensor) -> None:
+        self.prev_v[idx] = v.to(F32)
+        self.lpf.y[idx] = 0.0
+
+    def update(self, v: torch.Tensor, valid: torch.Tensor) -> None:
+        v = v.to(F32)
+        ok = valid & torch.isfinite(v).all(-1) & torch.isfinite(self.prev_v).all(-1)
+        a = torch.where(ok.unsqueeze(-1), (v - self.prev_v) / self.dt, torch.zeros_like(v))
+        ah = torch.sqrt(a[:, 0] * a[:, 0] + a[:, 1] * a[:, 1])
+        big = ah > self.max_acc
+        ahs = torch.where(big, ah, torch.ones_like(ah))
+        a = torch.stack((torch.where(big, a[:, 0] * self.max_acc / ahs, a[:, 0]),
+                         torch.where(big, a[:, 1] * self.max_acc / ahs, a[:, 1]),
+                         a[:, 2].clamp(-0.5 * self.g, 0.5 * self.g)), -1)
+        a = torch.where(torch.isfinite(a).all(-1, keepdim=True), a, torch.zeros_like(a))
+        self.lpf.apply(a)
+        self.prev_v = v.clone()
+
+    def value(self) -> torch.Tensor:
+        a = self.lpf.y
+        if self.db <= 0.0:
+            return a.clone()
+        db = torch.tensor(self.db, dtype=F32)
+        ah = torch.sqrt(a[:, 0] * a[:, 0] + a[:, 1] * a[:, 1])
+        sh = torch.where(ah > db, (ah - db) / torch.where(ah > db, ah, torch.ones_like(ah)), torch.zeros_like(ah))
+        az = torch.where(a[:, 2].abs() > db, a[:, 2] - torch.sign(a[:, 2]) * db, torch.zeros_like(ah))
+        return torch.stack((a[:, 0] * sh, a[:, 1] * sh, az), -1)
+
+    def sf_ref(self) -> torch.Tensor:
+        r = self.value()
+        r[:, 2] = r[:, 2] + torch.tensor(self.g, dtype=F32)
+        return r
